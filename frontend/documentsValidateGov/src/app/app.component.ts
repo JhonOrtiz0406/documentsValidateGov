@@ -1,12 +1,11 @@
 import { Component } from '@angular/core';
-import { RouterOutlet } from '@angular/router';
+import { DocumentUploadComponent } from './components/document-upload/document-upload.component';
 
 @Component({
   selector: 'app-root',
-  imports: [RouterOutlet],
-  templateUrl: './app.component.html',
-  styleUrl: './app.component.css'
+  standalone: true,
+  imports: [DocumentUploadComponent],
+  template: '<app-document-upload />',
+  styles: [`:host { display: block; min-height: 100vh; }`]
 })
-export class AppComponent {
-  title = 'documentsValidateGov';
-}
+export class AppComponent {}

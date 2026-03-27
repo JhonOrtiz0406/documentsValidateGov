@@ -1,16 +1,12 @@
 server:
-  port: 8080
+  port: 8088
 spring:
   application:
-    name: "ScaffoldQuickStart"
+    name: "DocumentsValidateGov"
   devtools:
     add-properties: false
-  h2:
-    console:
-      enabled: true
-      path: "/h2"
-  profiles:
-    include: null
+  codec:
+    max-in-memory-size: 50MB
 management:
   endpoints:
     web:
@@ -21,4 +17,8 @@ management:
       probes:
         enabled: true
 cors:
-  allowed-origins: "http://localhost:4200,http://localhost:8080"
+  allowed-origins: "http://localhost:4200,http://localhost:8080,http://localhost"
+snr:
+  api:
+    url: "https://certificados.supernotariado.gov.co/certificado/external/validation/validate.snr"
+    timeout: 10000

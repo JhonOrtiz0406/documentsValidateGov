@@ -1,0 +1,207 @@
+<div class="container">
+  <!-- Header -->
+  <header class="header">
+    <div class="header-glow"></div>
+    <div class="logo-section">
+      <div class="logo-icon">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+          <path d="M9 15l2 2 4-4"/>
+        </svg>
+      </div>
+      <div>
+        <h1>Validador de Documentos</h1>
+        <p class="subtitle">Superintendencia de Notariado y Registro — Colombia</p>
+      </div>
+    </div>
+  </header>
+
+  <!-- Error Message -->
+  @if (errorMessage()) {
+    <div class="error-banner" role="alert">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="10"/>
+        <line x1="15" y1="9" x2="9" y2="15"/>
+        <line x1="9" y1="9" x2="15" y2="15"/>
+      </svg>
+      <span>{{ errorMessage() }}</span>
+    </div>
+  }
+
+  <!-- Upload Zone -->
+  <div
+    id="dropzone"
+    class="dropzone"
+    [class.drag-over]="isDragOver()"
+    [class.has-files]="hasFiles()"
+    (dragover)="onDragOver($event)"
+    (dragleave)="onDragLeave($event)"
+    (drop)="onDrop($event)"
+    (click)="fileInput.click()"
+  >
+    <input
+      #fileInput
+      type="file"
+      accept=".pdf"
+      multiple
+      (change)="onFileSelect($event)"
+      class="file-input"
+    />
+
+    <div class="dropzone-content">
+      <div class="upload-icon" [class.pulse]="isDragOver()">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+      </div>
+      <p class="dropzone-title">Arrastra tus archivos PDF aquí</p>
+      <p class="dropzone-subtitle">o haz clic para seleccionar archivos</p>
+      <div class="dropzone-badge">PDF</div>
+    </div>
+  </div>
+
+  <!-- File List -->
+  @if (hasFiles()) {
+    <div class="files-section">
+      <div class="section-header">
+        <h2>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
+            <polyline points="13 2 13 9 20 9"/>
+          </svg>
+          {{ files().length }} archivo{{ files().length > 1 ? 's' : '' }} seleccionado{{ files().length > 1 ? 's' : '' }}
+        </h2>
+        <button class="btn-ghost" (click)="clearAll()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+          </svg>
+          Limpiar todo
+        </button>
+      </div>
+
+      <div class="file-list">
+        @for (file of files(); track $index) {
+          <div class="file-item" [style.animation-delay]="$index * 50 + 'ms'">
+            <div class="file-icon">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+            </div>
+            <div class="file-info">
+              <span class="file-name">{{ file.name }}</span>
+              <span class="file-size">{{ formatFileSize(file.size) }}</span>
+            </div>
+            <button class="btn-remove" (click)="removeFile($index); $event.stopPropagation()">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="6" x2="6" y2="18"/>
+                <line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+        }
+      </div>
+
+      <button
+        id="validate-btn"
+        class="btn-primary"
+        (click)="validateDocuments(); $event.stopPropagation()"
+        [disabled]="isLoading()"
+      >
+        @if (isLoading()) {
+          <div class="spinner"></div>
+          <span>Validando documentos...</span>
+        } @else {
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 12l2 2 4-4"/>
+            <path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/>
+          </svg>
+          <span>Validar Documentos</span>
+        }
+      </button>
+    </div>
+  }
+
+  <!-- Results -->
+  @if (hasResults()) {
+    <div class="results-section">
+      <h2 class="section-title">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+          <polyline points="22 4 12 14.01 9 11.01"/>
+        </svg>
+        Resultados de Validación
+      </h2>
+
+      <div class="results-grid">
+        @for (result of results(); track $index) {
+          <div class="result-card" [class]="getStatusClass(result.status)" [style.animation-delay]="$index * 100 + 'ms'">
+            <div class="result-header">
+              <div class="result-status-badge" [class]="getStatusClass(result.status)">
+                <span class="status-icon">{{ getStatusIcon(result.status) }}</span>
+                <span>{{ getStatusLabel(result.status) }}</span>
+              </div>
+            </div>
+            <div class="result-body">
+              <div class="result-filename">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/>
+                </svg>
+                <span>{{ result.fileName }}</span>
+              </div>
+              <div class="result-detail">
+                <span class="detail-label">PIN:</span>
+                <code class="detail-value">{{ result.pin }}</code>
+              </div>
+              <p class="result-message">{{ result.message }}</p>
+            </div>
+          </div>
+        }
+      </div>
+
+      <!-- Summary Table -->
+      <div class="summary-table-wrapper">
+        <table class="summary-table" id="results-table">
+          <thead>
+            <tr>
+              <th>Archivo</th>
+              <th>PIN</th>
+              <th>Estado</th>
+              <th>Mensaje</th>
+            </tr>
+          </thead>
+          <tbody>
+            @for (result of results(); track $index) {
+              <tr>
+                <td>{{ result.fileName }}</td>
+                <td><code>{{ result.pin }}</code></td>
+                <td>
+                  <span class="table-badge" [class]="getStatusClass(result.status)">
+                    {{ getStatusLabel(result.status) }}
+                  </span>
+                </td>
+                <td>{{ result.message }}</td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+  }
+
+  <!-- Loading Overlay -->
+  @if (isLoading()) {
+    <div class="loading-overlay">
+      <div class="loading-card">
+        <div class="loading-spinner-large"></div>
+        <p class="loading-text">Procesando documentos...</p>
+        <p class="loading-subtext">Extrayendo PIN y validando con la SNR</p>
+      </div>
+    </div>
+  }
+</div>
