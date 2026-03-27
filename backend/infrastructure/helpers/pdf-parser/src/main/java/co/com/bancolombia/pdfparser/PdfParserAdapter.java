@@ -20,14 +20,8 @@ public class PdfParserAdapter implements PdfParserGateway {
 
     // Regex patterns for PIN extraction from Colombian notarial certificates
     private static final Pattern[] PIN_PATTERNS = {
-            // Direct PIN label
-            Pattern.compile("(?i)(?:PIN|C[oó]digo\\s+de\\s+[Vv]erificaci[oó]n|N[uú]mero\\s+de\\s+[Vv]erificaci[oó]n)\\s*[:\\-]?\\s*([A-Za-z0-9\\-]{6,30})"),
-            // Alphanumeric code pattern (common in SNR certificates)
-            Pattern.compile("(?i)verificaci[oó]n[^\\n]{0,50}?([A-Z0-9]{8,20})"),
-            // Generic alphanumeric code with hyphens
-            Pattern.compile("\\b([A-Z0-9]{4,8}-[A-Z0-9]{4,8}(?:-[A-Z0-9]{4,8})?)\\b"),
-            // Fallback: long alphanumeric sequence
-            Pattern.compile("\\b([A-Z0-9]{10,25})\\b")
+            // Nuevo patrón: Certificado generado con el Pin No: <PIN>
+            Pattern.compile("(?i)Certificado\\s+generado\\s+con\\s+el\\s+Pin\\s+No[:\\-]?\\s*([A-Za-z0-9\\-]{6,30})")
     };
 
     @Override

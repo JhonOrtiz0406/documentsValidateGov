@@ -14,9 +14,9 @@ export interface ValidationResult {
 })
 export class ValidationService {
 
-  private apiUrl = 'http://localhost:8080/api/validate-documents';
+  private apiUrl = 'http://localhost:8088/api/validate-documents';
 
-  constructor(private http: HttpClient) {}
+  constructor(private http: HttpClient) { }
 
   validateDocuments(files: File[]): Observable<ValidationResult[]> {
     const formData = new FormData();
