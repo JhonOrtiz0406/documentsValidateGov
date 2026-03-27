@@ -22,3 +22,4 @@ snr:
   api:
     url: "https://certificados.supernotariado.gov.co/certificado/external/validation/validate.snr"
     timeout: 10000
+    request-timeout-seconds: 12
