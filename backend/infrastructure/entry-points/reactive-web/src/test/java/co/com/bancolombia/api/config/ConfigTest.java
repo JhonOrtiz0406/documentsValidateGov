@@ -2,11 +2,13 @@ package co.com.bancolombia.api.config;
 
 import co.com.bancolombia.api.Handler;
 import co.com.bancolombia.api.RouterRest;
+import co.com.bancolombia.usecase.validate.ValidateDocumentsUseCase;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webflux.test.autoconfigure.WebFluxTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.test.context.ContextConfiguration;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.reactive.server.WebTestClient;
 
 @ContextConfiguration(classes = {RouterRest.class, Handler.class})
@@ -17,10 +19,13 @@ class ConfigTest {
     @Autowired
     private WebTestClient webTestClient;
 
+    @MockitoBean
+    private ValidateDocumentsUseCase validateDocumentsUseCase;
+
     @Test
     void corsConfigurationShouldAllowOrigins() {
         webTestClient.get()
-                .uri("/api/usecase/path")
+                .uri("/api/health")
                 .exchange()
                 .expectStatus().isOk()
                 .expectHeader().valueEquals("Content-Security-Policy",

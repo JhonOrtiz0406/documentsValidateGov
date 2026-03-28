@@ -29,6 +29,12 @@ public class ValidateDocumentsUseCase {
         return pdfParserGateway.extractPin(fileData.content())
                 .subscribeOn(Schedulers.boundedElastic())
                 .flatMap(pin -> validatePin(fileData.fileName(), pin))
+                .switchIfEmpty(Mono.just(DocumentValidationResult.builder()
+                        .fileName(fileData.fileName())
+                        .pin("N/A")
+                        .status(ValidationStatus.ERROR)
+                        .message("No se pudo extraer el PIN del documento")
+                        .build()))
                 .onErrorResume(e -> {
                     log.log(Level.SEVERE, "Error processing file " + fileData.fileName() + ": " + e.getMessage(), e);
                     return Mono.just(DocumentValidationResult.builder()

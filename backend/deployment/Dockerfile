@@ -19,8 +19,13 @@ RUN chmod +x gradlew && ./gradlew clean build -x test -x pitest --no-daemon
 FROM eclipse-temurin:25-jre-alpine
 WORKDIR /app
 
-# Install Tesseract OCR for PDF fallback
+# Install Tesseract OCR 5 + Spanish language data for PDF PIN extraction
 RUN apk add --no-cache tesseract-ocr tesseract-ocr-data-spa
+
+# Resolve tessdata path: Alpine places it under /usr/share/tessdata
+RUN TESSDATA=$(tesseract --list-langs 2>&1 | grep "tessdata" | head -1 | sed 's/.*(\(.*\)).*/\1/' || true) && \
+    echo "Tessdata: $TESSDATA" && \
+    tesseract --list-langs 2>&1
 
 # Create non-root user
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
@@ -33,6 +38,7 @@ RUN chown -R appuser:appgroup /app
 
 USER appuser
 
+ENV TESSDATA_PREFIX="/usr/share/tessdata"
 ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=70 -Djava.security.egd=file:/dev/./urandom"
 
 EXPOSE 8080
