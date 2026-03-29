@@ -1,6 +1,7 @@
 package co.com.bancolombia.usecase.validate;
 
 import co.com.bancolombia.model.document.DocumentValidationResult;
+import co.com.bancolombia.model.document.PinExtractionResult;
 import co.com.bancolombia.model.document.ValidationStatus;
 import co.com.bancolombia.model.document.gateway.DocumentValidationGateway;
 import co.com.bancolombia.model.document.gateway.PdfParserGateway;
@@ -26,9 +27,9 @@ public class ValidateDocumentsUseCase {
 
     private Mono<DocumentValidationResult> processFile(FileData fileData) {
         log.info("Processing file: " + fileData.fileName());
-        return pdfParserGateway.extractPin(fileData.content())
+        return pdfParserGateway.extractPins(fileData.content())
                 .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(pin -> validatePin(fileData.fileName(), pin))
+                .flatMap(extraction -> handleExtraction(fileData.fileName(), extraction))
                 .switchIfEmpty(Mono.just(DocumentValidationResult.builder()
                         .fileName(fileData.fileName())
                         .pin("N/A")
@@ -36,7 +37,7 @@ public class ValidateDocumentsUseCase {
                         .message("No se pudo extraer el PIN del documento")
                         .build()))
                 .onErrorResume(e -> {
-                    log.log(Level.SEVERE, "Error processing file " + fileData.fileName() + ": " + e.getMessage(), e);
+                    log.log(Level.SEVERE, "Error processing file " + fileData.fileName(), e);
                     return Mono.just(DocumentValidationResult.builder()
                             .fileName(fileData.fileName())
                             .pin("N/A")
@@ -46,7 +47,23 @@ public class ValidateDocumentsUseCase {
                 });
     }
 
-    private Mono<DocumentValidationResult> validatePin(String fileName, String pin) {
+    private Mono<DocumentValidationResult> handleExtraction(String fileName, PinExtractionResult extraction) {
+
+        // ── ALERT: multiple different PINs found across pages ──────────────────────
+        if (extraction.hasConflict()) {
+            String pinsFound = String.join(", ", extraction.pins());
+            log.warning("CONFLICT in " + fileName + ": multiple PINs found: " + pinsFound);
+            return Mono.just(DocumentValidationResult.builder()
+                    .fileName(fileName)
+                    .pin(pinsFound)
+                    .status(ValidationStatus.ALERT)
+                    .message("Se encontraron múltiples PINs en el documento: " + pinsFound +
+                             ". Por favor revise el documento manualmente.")
+                    .build());
+        }
+
+        // ── Normal flow: single PIN extracted ──────────────────────────────────────
+        String pin = extraction.primaryPin();
         if (pin == null || pin.isBlank()) {
             return Mono.just(DocumentValidationResult.builder()
                     .fileName(fileName)

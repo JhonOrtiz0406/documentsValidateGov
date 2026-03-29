@@ -21,7 +21,7 @@ cors:
 snr:
   api:
     url: "https://certificados.supernotariado.gov.co/certificado/external/validation/validate.snr"
-    timeout: 10000
-    request-timeout-seconds: 12
+    timeout: 20000
+    request-timeout-seconds: 25
 ocr:
   tessdata-path: "C:/Program Files/Tesseract-OCR/tessdata"

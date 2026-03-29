@@ -5,7 +5,7 @@ import { Observable } from 'rxjs';
 export interface ValidationResult {
   fileName: string;
   pin: string;
-  status: 'VALID' | 'INVALID' | 'ERROR';
+  status: 'VALID' | 'INVALID' | 'ERROR' | 'ALERT';
   message: string;
 }
 

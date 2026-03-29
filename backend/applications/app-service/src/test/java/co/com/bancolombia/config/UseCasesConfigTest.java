@@ -36,7 +36,8 @@ class UseCasesConfigTest {
 
         @Bean
         public PdfParserGateway pdfParserGateway() {
-            return pdfBytes -> Mono.just("MOCK_PIN");
+            return pdfBytes -> Mono.just(
+                    co.com.bancolombia.model.document.PinExtractionResult.single("MOCK_PIN"));
         }
 
         @Bean

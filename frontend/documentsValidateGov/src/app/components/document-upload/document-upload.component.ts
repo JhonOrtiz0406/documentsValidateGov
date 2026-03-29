@@ -98,6 +98,7 @@ export class DocumentUploadComponent {
       case 'VALID': return 'status-valid';
       case 'INVALID': return 'status-invalid';
       case 'ERROR': return 'status-error';
+      case 'ALERT': return 'status-alert';
       default: return '';
     }
   }
@@ -107,6 +108,7 @@ export class DocumentUploadComponent {
       case 'VALID': return '✓';
       case 'INVALID': return '✗';
       case 'ERROR': return '⚠';
+      case 'ALERT': return '⚑';
       default: return '?';
     }
   }
@@ -116,6 +118,7 @@ export class DocumentUploadComponent {
       case 'VALID': return 'Válido';
       case 'INVALID': return 'Inválido';
       case 'ERROR': return 'Error';
+      case 'ALERT': return 'Alerta';
       default: return status;
     }
   }

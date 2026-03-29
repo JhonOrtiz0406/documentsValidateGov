@@ -1,7 +1,8 @@
 package co.com.bancolombia.model.document.gateway;
 
+import co.com.bancolombia.model.document.PinExtractionResult;
 import reactor.core.publisher.Mono;
 
 public interface PdfParserGateway {
-    Mono<String> extractPin(byte[] pdfBytes);
+    Mono<PinExtractionResult> extractPins(byte[] pdfBytes);
 }

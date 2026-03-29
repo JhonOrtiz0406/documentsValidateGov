@@ -1,5 +1,6 @@
 package co.com.bancolombia.pdfparser;
 
+import co.com.bancolombia.model.document.PinExtractionResult;
 import co.com.bancolombia.model.document.gateway.PdfParserGateway;
 import lombok.extern.slf4j.Slf4j;
 import net.sourceforge.tess4j.Tesseract;
@@ -13,7 +14,7 @@ import reactor.core.publisher.Mono;
 
 import java.awt.*;
 import java.awt.image.BufferedImage;
-import java.util.ArrayList;
+import java.util.*;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -22,276 +23,365 @@ import java.util.regex.Pattern;
 @Component
 public class PdfParserAdapter implements PdfParserGateway {
 
-    // ---- Document identification ----
-    private static final Pattern CERTIFICATE_TITLE = Pattern.compile(
-            "(?i)OFICINA\\s+DE\\s+REGISTRO\\s+DE\\s+INSTRUMENTOS\\s+P[UÚ]BLICOS");
-
-    // ---- PIN extraction patterns (ordered from most specific to least) ----
-    private static final List<Pattern> PIN_PATTERNS = List.of(
-            // 1) Exact match: "Certificado generado con el Pin No: <digits>"
-            //    Accounts for OCR errors: spaces inside words, missing spaces, etc.
-            Pattern.compile(
-                    "(?i)C\\s*e\\s*r\\s*t\\s*i\\s*f\\s*i\\s*c\\s*a\\s*d\\s*o\\s+" +
-                    "g\\s*e\\s*n\\s*e\\s*r\\s*a\\s*d\\s*o\\s+" +
-                    "c\\s*o\\s*n\\s+(?:e\\s*l\\s+)?P\\s*i\\s*n\\s+" +
-                    "N\\s*o\\s*[:\\-.]?\\s*(\\d{10,25})"),
-            // 2) All joined without spaces (OCR glued): "CertificadogeneradoconelPinNo:<digits>"
-            Pattern.compile(
-                    "(?i)Certificadogeneradoconel?PinNo[:\\-.]?\\s*(\\d{10,25})"),
-            // 3) "Pin No:" or "Pin No :" followed by digits
-            Pattern.compile(
-                    "(?i)Pin\\s*No\\s*[:\\-.]?\\s*(\\d{10,25})"),
-            // 4) "Pin:" or "PIN:" followed by digits
-            Pattern.compile(
-                    "(?i)P\\s*[iI1]\\s*[nN]\\s*[:\\-.]\\s*(\\d{10,25})"),
-            // 5) Fallback: look for a long numeric sequence (19-20 digits typical for SNR PINs)
-            //    Only after confirming it's a certificate page
-            Pattern.compile(
-                    "(\\d{19,25})")
+    // ── Certificate-page keywords ─────────────────────────────────────────────────
+    private static final List<String> CERT_KEYWORDS = List.of(
+            "OFICINA DE REGISTRO DE INSTRUMENTOS",
+            "CERTIFICADO DE TRADICION",
+            "CERTIFICADO DE LIBERTAD",
+            "CERIFICADO DE LIBERTAD",   // common misspelling in real docs
+            "CERIFICADO DE TRADICION",
+            "MATRICULA INMOBILIARIA",
+            "MATRÍCULA INMOBILIARIA"
     );
 
+    // ── PIN digit block ───────────────────────────────────────────────────────────
+    // Captures digits optionally separated by spaces/tabs (PDFBox splits PDF text
+    // elements with spaces; long numbers may also wrap across lines).
+    // Post-processing: strip whitespace, validate as 10-25 pure digits.
+    private static final String DB = "(\\d[\\d \\t]{8,28}\\d)";
+
+    // ── PIN-label patterns, most specific → least specific ───────────────────────
+    private static final List<Pattern> LABELED = List.of(
+
+        // ── A: full phrase "Certificado generado con el Pin No:" ─────────────────
+        // A1 – normal word spacing
+        Pattern.compile(
+            "(?i)Certificado\\s+generado\\s+con\\s+(?:el\\s+)?[Pp]in\\s+[Nn]o\\s*[:\\-.]?\\s*" + DB),
+        // A2 – OCR inserts spaces inside each word
+        Pattern.compile(
+            "(?i)C\\s*e\\s*r\\s*t\\s*i\\s*f\\s*i\\s*c\\s*a\\s*d\\s*o\\s+" +
+            "g\\s*e\\s*n\\s*e\\s*r\\s*a\\s*d\\s*o\\s+" +
+            "c\\s*o\\s*n\\s+(?:e\\s*l\\s+)?P\\s*i\\s*n\\s+N\\s*o\\s*[:\\-.]?\\s*" + DB),
+        // A3 – OCR glued all words
+        Pattern.compile("(?i)Certificadogeneradoconel?PinNo[:\\-.]?\\s*" + DB),
+
+        // ── B: "Pin No:" variants ────────────────────────────────────────────────
+        // B1 – standard
+        Pattern.compile("(?i)Pin\\s*No\\s*[:\\-./]?\\s*" + DB),
+        // B2 – OCR spaced: "P i n   N o :"
+        Pattern.compile("(?i)P\\s*i\\s*n\\s+N\\s*o\\s*[:\\-./]?\\s*" + DB),
+        // B3 – degree/ordinal: "Pin N°" / "Pin Nº"
+        Pattern.compile("(?i)Pin\\s*N[°º]\\s*[:\\-.]?\\s*" + DB),
+
+        // ── C: bare "PIN:" label and Colombian document variants ─────────────────
+        // C1 – "PIN:" / "Pin:" with separator
+        Pattern.compile("(?i)P\\s*[iI1]\\s*[nN]\\s*[:\\-.]\\s*" + DB),
+        // C2 – "Número de Pin:" / "Numero de pin:"
+        Pattern.compile("(?i)N[uú]mero\\s+de\\s+[Pp]in\\s*[:\\-.]?\\s*" + DB),
+        // C3 – "Código PIN:" / "Cod. PIN:"
+        Pattern.compile("(?i)C[oó]d(?:igo)?[.\\s]*\\s*[Pp]in\\s*[:\\-.]?\\s*" + DB),
+        // C4 – "No. de pin:" / "No de pin:"
+        Pattern.compile("(?i)No\\.?\\s+de\\s+[Pp]in\\s*[:\\-.]?\\s*" + DB),
+        // C5 – any line starting with a long digit run right after "pin" keyword
+        //      e.g. "...pin\n2302285284729281146"  (label on previous line)
+        Pattern.compile("(?i)pin[^\\d\\n]{0,30}\\n[ \\t]*" + DB)
+    );
+
+    // Fallback: raw 15-25 digit run — only on confirmed certificate pages
+    private static final Pattern FALLBACK = Pattern.compile("(\\d{15,25})");
+
+    // ─────────────────────────────────────────────────────────────────────────────
+
     @Override
-    public Mono<String> extractPin(byte[] pdfBytes) {
-        return Mono.fromCallable(() -> doExtractPin(pdfBytes))
+    public Mono<PinExtractionResult> extractPins(byte[] pdfBytes) {
+        return Mono.fromCallable(() -> doExtractPins(pdfBytes))
                 .onErrorResume(e -> {
-                    log.error("Error extracting PIN from PDF: {}", e.getMessage());
+                    log.error("Error extracting PINs from PDF: {}", e.getMessage(), e);
                     return Mono.empty();
                 });
     }
 
-    private String doExtractPin(byte[] pdfBytes) throws Exception {
-        log.info("Starting PDF text extraction ({} bytes)", pdfBytes.length);
-        try (PDDocument document = Loader.loadPDF(pdfBytes)) {
-            int totalPages = document.getNumberOfPages();
+    private PinExtractionResult doExtractPins(byte[] pdfBytes) throws Exception {
+        log.info("Starting PDF PIN extraction ({} bytes)", pdfBytes.length);
+        try (PDDocument doc = Loader.loadPDF(pdfBytes)) {
+            int totalPages = doc.getNumberOfPages();
             log.info("PDF has {} pages", totalPages);
 
-            // Strategy 1: Text extraction with PDFBox
-            String pin = tryTextExtraction(document, totalPages);
-            if (pin != null) return pin;
+            PinExtractionResult result = tryTextExtraction(doc, totalPages);
+            if (result != null) return result;
 
-            // Strategy 2: OCR fallback for scanned/photo documents
-            log.info("Text extraction didn't find PIN, trying OCR fallback");
-            pin = tryOcrExtraction(document, totalPages);
-            if (pin != null) return pin;
+            log.info("Text extraction yielded no PIN; starting OCR");
+            result = tryOcrExtraction(doc, totalPages);
+            if (result != null) return result;
 
-            log.warn("No PIN found in PDF via text or OCR");
+            log.warn("No PIN found in PDF (neither text nor OCR)");
             return null;
         }
     }
 
-    private String tryTextExtraction(PDDocument document, int totalPages) throws Exception {
+    // ── Strategy 1: PDFBox text layer ─────────────────────────────────────────────
+
+    private PinExtractionResult tryTextExtraction(PDDocument doc, int totalPages) throws Exception {
         PDFTextStripper stripper = new PDFTextStripper();
 
-        // Try each page individually to find the certificate page
+        // cert pages → used for multi-page conflict detection
+        LinkedHashMap<Integer, String> certPagePins = new LinkedHashMap<>();
+        // any page that has a labeled PIN (even non-cert) → used as fallback
+        String firstLabeledPin = null;
+
         for (int page = 1; page <= totalPages; page++) {
             stripper.setStartPage(page);
             stripper.setEndPage(page);
-            String text = stripper.getText(document);
+            String text = stripper.getText(doc);
+            if (text == null || text.isBlank()) {
+                log.info("Page {} — empty (scanned image or no text layer)", page);
+                continue;
+            }
 
-            if (text == null || text.isBlank()) continue;
+            logPageText(page, text);
 
-            log.debug("Page {} text ({} chars): {}", page, text.length(),
-                    text.length() > 200 ? text.substring(0, 200) + "..." : text);
+            boolean isCert = isCertificatePage(text);
+            log.info("Page {} — isCertPage={}, chars={}", page, isCert, text.length());
 
-            // Check if this is a certificate page
-            if (isCertificatePage(text)) {
-                log.info("Page {} identified as certificate page", page);
-                String pin = findPinInText(text, false);
+            // Try ALL labeled patterns on EVERY page
+            String pin = findWithLabeledPatterns(text, false);
+
+            if (pin != null) {
+                log.info("Page {} — labeled-pattern PIN: {}", page, pin);
+                if (isCert) {
+                    certPagePins.put(page, pin);
+                } else if (firstLabeledPin == null) {
+                    firstLabeledPin = pin;
+                }
+            } else if (isCert) {
+                // Cert page but labeled pattern didn't match → try fallback digits
+                pin = findWithFallback(text);
                 if (pin != null) {
-                    log.info("PIN found via text extraction on page {}: {}", page, pin);
-                    return pin;
+                    log.info("Page {} — fallback-digit PIN: {}", page, pin);
+                    certPagePins.put(page, pin);
+                } else {
+                    log.warn("Page {} — cert page but no PIN extracted", page);
                 }
             }
         }
 
-        // If no certificate page found, try all text combined
-        stripper.setStartPage(1);
-        stripper.setEndPage(totalPages);
-        String allText = stripper.getText(document);
-        if (allText != null && !allText.isBlank()) {
-            String pin = findPinInText(allText, false);
-            if (pin != null) {
-                log.info("PIN found in combined text: {}", pin);
-                return pin;
-            }
+        // Build result: cert-page conflict check takes priority
+        if (!certPagePins.isEmpty()) {
+            return buildResult(certPagePins);
         }
-
+        if (firstLabeledPin != null) {
+            return PinExtractionResult.single(firstLabeledPin);
+        }
         return null;
     }
 
-    private String tryOcrExtraction(PDDocument document, int totalPages) {
-        try {
-            PDFRenderer renderer = new PDFRenderer(document);
-            Tesseract tesseract = createTesseract();
+    // ── Strategy 2: Tesseract OCR ─────────────────────────────────────────────────
 
-            int pagesToScan = Math.min(totalPages, 5);
+    private PinExtractionResult tryOcrExtraction(PDDocument doc, int totalPages) {
+        try {
+            PDFRenderer renderer = new PDFRenderer(doc);
+            Tesseract tess = createTesseract();
+            int pagesToScan = Math.min(totalPages, 6);
+
+            LinkedHashMap<Integer, String> certPagePins = new LinkedHashMap<>();
+            String firstLabeledPin = null;
 
             for (int i = 0; i < pagesToScan; i++) {
-                log.info("OCR processing page {}/{}", i + 1, pagesToScan);
+                log.info("OCR page {}/{}", i + 1, pagesToScan);
+                String text = ocrPage(renderer, tess, i, 300);
+                if (text.isBlank()) continue;
 
-                // Render at high DPI for better OCR accuracy
-                BufferedImage rawImage = renderer.renderImageWithDPI(i, 300, ImageType.RGB);
+                logPageText(i + 1, text);
 
-                // Apply image preprocessing for blurry/scanned documents
-                BufferedImage processedImage = preprocessImage(rawImage);
+                boolean isCert = isCertificatePage(text);
 
-                String pageText = tesseract.doOCR(processedImage);
-                log.debug("OCR page {} extracted {} chars", i + 1, pageText.length());
+                String pin = findWithLabeledPatterns(text, true);
+                if (pin == null && isCert) {
+                    // Retry at 600 DPI for better accuracy on blurry pages
+                    log.info("OCR: retrying page {} at 600 DPI", i + 1);
+                    text = ocrPage(renderer, tess, i, 600);
+                    pin = findWithLabeledPatterns(text, true);
+                    if (pin == null) pin = findWithFallback(text);
+                }
 
-                if (isCertificatePage(pageText)) {
-                    log.info("OCR: Page {} identified as certificate page", i + 1);
-                    String pin = findPinInText(pageText, true);
-                    if (pin != null) {
-                        log.info("PIN found via OCR on page {}: {}", i + 1, pin);
-                        return pin;
-                    }
-
-                    // If blurry: try higher DPI
-                    log.info("OCR: Retrying page {} at 600 DPI for better accuracy", i + 1);
-                    rawImage = renderer.renderImageWithDPI(i, 600, ImageType.RGB);
-                    processedImage = preprocessImage(rawImage);
-                    pageText = tesseract.doOCR(processedImage);
-                    pin = findPinInText(pageText, true);
-                    if (pin != null) {
-                        log.info("PIN found via OCR (600 DPI) on page {}: {}", i + 1, pin);
-                        return pin;
-                    }
+                if (pin != null) {
+                    log.info("OCR page {} PIN: {}", i + 1, pin);
+                    if (isCert) certPagePins.put(i + 1, pin);
+                    else if (firstLabeledPin == null) firstLabeledPin = pin;
                 }
             }
 
-            // Fallback: OCR all pages and search without certificate title check
-            StringBuilder fullText = new StringBuilder();
-            for (int i = 0; i < pagesToScan; i++) {
-                BufferedImage img = renderer.renderImageWithDPI(i, 300, ImageType.RGB);
-                BufferedImage processed = preprocessImage(img);
-                fullText.append(tesseract.doOCR(processed)).append("\n");
-            }
-            String allOcrText = fullText.toString();
-            return findPinInText(allOcrText, true);
+            if (!certPagePins.isEmpty()) return buildResult(certPagePins);
+            if (firstLabeledPin != null) return PinExtractionResult.single(firstLabeledPin);
+
+            // Last resort: OCR all pages combined
+            StringBuilder all = new StringBuilder();
+            for (int i = 0; i < pagesToScan; i++)
+                all.append(ocrPage(renderer, tess, i, 300)).append("\n");
+            String pin = findBestPinInText(all.toString(), true);
+            return pin != null ? PinExtractionResult.single(pin) : null;
 
         } catch (Throwable e) {
-            log.warn("OCR fallback failed: {}. Tesseract may not be installed.", e.getMessage());
+            log.warn("OCR extraction failed: {}", e.getMessage());
             return null;
         }
     }
 
-    /**
-     * Preprocesses an image for better OCR accuracy:
-     * - Convert to grayscale
-     * - Increase contrast
-     * - Apply simple thresholding (binarization)
-     */
-    private BufferedImage preprocessImage(BufferedImage source) {
-        int width = source.getWidth();
-        int height = source.getHeight();
-
-        BufferedImage gray = new BufferedImage(width, height, BufferedImage.TYPE_BYTE_GRAY);
-        Graphics2D g = gray.createGraphics();
-        g.drawImage(source, 0, 0, null);
-        g.dispose();
-
-        // Apply Otsu-like simple binarization for scanned/photo documents
-        BufferedImage binary = new BufferedImage(width, height, BufferedImage.TYPE_BYTE_BINARY);
-        Graphics2D g2 = binary.createGraphics();
-        g2.drawImage(gray, 0, 0, null);
-        g2.dispose();
-
-        return binary;
+    private String ocrPage(PDFRenderer renderer, Tesseract tess, int idx, int dpi) {
+        try {
+            BufferedImage img = renderer.renderImageWithDPI(idx, dpi, ImageType.RGB);
+            return tess.doOCR(preprocessImage(img));
+        } catch (Exception e) {
+            log.warn("OCR failed page {} at {} DPI: {}", idx + 1, dpi, e.getMessage());
+            return "";
+        }
     }
 
-    private boolean isCertificatePage(String text) {
-        if (text == null) return false;
-        String normalized = text.replaceAll("\\s+", " ").toUpperCase();
-        return normalized.contains("OFICINA DE REGISTRO DE INSTRUMENTOS")
-                || normalized.contains("CERTIFICADO DE TRADICION")
-                || normalized.contains("MATRICULA INMOBILIARIA")
-                || (normalized.contains("CERTIFICADO") && normalized.contains("PIN NO"));
-    }
+    // ── Core PIN-extraction helpers ───────────────────────────────────────────────
 
-    String findPinInText(String text, boolean isOcr) {
+    /** Full extraction pipeline: merge split digits, try labeled patterns, then fallback. */
+    String findBestPinInText(String text, boolean isOcr) {
         if (text == null || text.isBlank()) return null;
-
-        // Clean OCR artifacts: remove random spaces within words
-        String cleaned = text;
-        if (isOcr) {
-            // Normalize common OCR misreads
-            cleaned = cleaned
-                    .replace("|", "l")
-                    .replace("¡", "i")
-                    .replace("!", "l");
-        }
-
-        // Merge digit sequences that are split across lines (PIN wrapped to next line in PDF).
-        // e.g. "230228528472928\n1146" → "2302285284729281146"
-        // Replace any run of digits, optional horizontal whitespace, a line break,
-        // optional horizontal whitespace, then another run of digits → concatenated digits.
-        // Apply repeatedly until no more merges are possible.
-        String merged = cleaned;
-        String prev;
-        do {
-            prev = merged;
-            merged = prev.replaceAll("(\\d+)[ \\t]*(?:\\r?\\n|\\r)[ \\t]*(\\d+)", "$1$2");
-        } while (!merged.equals(prev));
-
-        // Try patterns 1–4 on the merged text first, then on the original
-        for (String candidate : List.of(merged, cleaned)) {
-            for (int i = 0; i < PIN_PATTERNS.size() - 1; i++) {
-                Pattern pattern = PIN_PATTERNS.get(i);
-                Matcher matcher = pattern.matcher(candidate);
-                if (matcher.find()) {
-                    String pin = matcher.group(1).replaceAll("\\s+", "").trim();
-                    if (pin.length() >= 10) {
-                        log.info("PIN matched by pattern {} (merged={}): {}", i + 1, candidate == merged, pin);
-                        return pin;
-                    }
-                }
-            }
-        }
-
-        // Pattern 5 (fallback long digits) only if this is a certificate page
-        if (isCertificatePage(merged)) {
-            Pattern fallback = PIN_PATTERNS.get(PIN_PATTERNS.size() - 1);
-            for (String candidate : List.of(merged, cleaned)) {
-                Matcher matcher = fallback.matcher(candidate);
-                List<String> candidates = new ArrayList<>();
-                while (matcher.find()) {
-                    candidates.add(matcher.group(1));
-                }
-                // Prefer sequences of 19-22 digits (typical SNR PIN length)
-                for (String c : candidates) {
-                    if (c.length() >= 19 && c.length() <= 22) {
-                        log.info("PIN matched by fallback pattern ({} digits, merged={}): {}", c.length(), candidate == merged, c);
-                        return c;
-                    }
-                }
-            }
-        }
-
+        String pin = findWithLabeledPatterns(text, isOcr);
+        if (pin != null) return pin;
+        if (isCertificatePage(text)) return findWithFallback(text);
         return null;
     }
 
+    /** Try every labeled pattern (A–C5). Merges newline/space-split digits first. */
+    private String findWithLabeledPatterns(String text, boolean isOcr) {
+        String cleaned = isOcr
+                ? text.replace("|", "I").replace("¡", "i").replace("!", "I")
+                : text;
+
+        // Merge digits split by newlines
+        String merged = mergeNewlineSplitDigits(cleaned);
+
+        for (int i = 0; i < LABELED.size(); i++) {
+            String pin = applyPattern(LABELED.get(i), merged, "L" + (i + 1));
+            if (pin != null) return pin;
+        }
+        return null;
+    }
+
+    /** Fallback: find any 15-25 digit run; prefer 19-22 digits (typical SNR PIN). */
+    private String findWithFallback(String text) {
+        String merged = mergeNewlineSplitDigits(text);
+        Matcher m = FALLBACK.matcher(merged);
+        String best = null;
+        while (m.find()) {
+            String c = m.group(1);
+            if (c.length() >= 19 && c.length() <= 22) {
+                log.info("Fallback PIN ({} digits): {}", c.length(), c);
+                return c;
+            }
+            if (best == null && c.length() >= 15) best = c;
+        }
+        if (best != null) log.info("Fallback PIN (backup {} digits): {}", best.length(), best);
+        return best;
+    }
+
+    /**
+     * Apply a single pattern. The capture group DB allows spaces/tabs within digits;
+     * we strip them and validate as 10-25 pure digits.
+     */
+    private String applyPattern(Pattern p, String text, String label) {
+        Matcher m = p.matcher(text);
+        while (m.find()) {
+            String raw = m.group(1);
+            String pin = raw.replaceAll("[ \\t]+", "");
+            if (pin.matches("\\d{10,25}")) {
+                log.info("Pattern {} matched PIN: {}", label, pin);
+                return pin;
+            }
+            log.debug("Pattern {} matched '{}' but stripped '{}' failed length check", label, raw, pin);
+        }
+        return null;
+    }
+
+    /** Repeatedly merge digit sequences split only by a newline. */
+    private String mergeNewlineSplitDigits(String text) {
+        String prev, current = text;
+        do {
+            prev = current;
+            current = prev.replaceAll("(\\d+)[ \\t]*(?:\\r?\\n|\\r)[ \\t]*(\\d+)", "$1$2");
+        } while (!current.equals(prev));
+        return current;
+    }
+
+    // ── Result builder ────────────────────────────────────────────────────────────
+
+    private PinExtractionResult buildResult(LinkedHashMap<Integer, String> pagePins) {
+        List<String> unique = new ArrayList<>(new LinkedHashSet<>(pagePins.values()));
+        if (unique.size() == 1) {
+            log.info("All certificate pages agree on PIN: {}", unique.get(0));
+            return PinExtractionResult.single(unique.get(0));
+        }
+        log.warn("CONFLICT: multiple PINs across pages: {}", unique);
+        return PinExtractionResult.conflict(unique);
+    }
+
+    // ── Certificate-page detection ─────────────────────────────────────────────────
+
+    private boolean isCertificatePage(String text) {
+        if (text == null) return false;
+        String up = text.replaceAll("\\s+", " ").toUpperCase();
+        for (String kw : CERT_KEYWORDS) {
+            if (up.contains(kw)) return true;
+        }
+        // Also treat as cert page when the certificate+PIN combo appears
+        return (up.contains("CERTIFICADO") || up.contains("CERIFICADO"))
+                && (up.contains("PIN NO") || up.contains("PIN N°") || up.contains("PIN N"));
+    }
+
+    // ── Verbose page-text logging ──────────────────────────────────────────────────
+
+    private void logPageText(int page, String text) {
+        if (text == null || text.isBlank()) return;
+
+        // Always log a compact header
+        log.info("=== PAGE {} TEXT ({} chars) ===", page, text.length());
+
+        // Log the first 800 chars unconditionally
+        String head = text.length() > 800 ? text.substring(0, 800) + "…" : text;
+        log.info("PAGE {} HEAD: {}", page, head.replace("\n", "↵").replace("\r", ""));
+
+        // If "pin" appears anywhere, log the 300-char window around it
+        String lower = text.toLowerCase();
+        int pinIdx = lower.indexOf("pin");
+        if (pinIdx >= 0) {
+            int start = Math.max(0, pinIdx - 50);
+            int end   = Math.min(text.length(), pinIdx + 250);
+            String window = text.substring(start, end);
+            log.info("PAGE {} PIN-WINDOW: [{}]",
+                    page, window.replace("\n", "↵").replace("\r", ""));
+        }
+    }
+
+    // ── Image preprocessing ────────────────────────────────────────────────────────
+
+    private BufferedImage preprocessImage(BufferedImage src) {
+        int w = src.getWidth(), h = src.getHeight();
+        BufferedImage gray = new BufferedImage(w, h, BufferedImage.TYPE_BYTE_GRAY);
+        Graphics2D g = gray.createGraphics();
+        g.drawImage(src, 0, 0, null);
+        g.dispose();
+        BufferedImage bin = new BufferedImage(w, h, BufferedImage.TYPE_BYTE_BINARY);
+        Graphics2D g2 = bin.createGraphics();
+        g2.drawImage(gray, 0, 0, null);
+        g2.dispose();
+        return bin;
+    }
+
+    // ── Tesseract setup ───────────────────────────────────────────────────────────
+
     private Tesseract createTesseract() {
-        // Help tess4j find libtesseract DLL on Windows
         String winInstall = "C:\\Program Files\\Tesseract-OCR";
         if (new java.io.File(winInstall).exists()) {
             String existing = System.getProperty("jna.library.path", "");
-            if (!existing.contains(winInstall)) {
+            if (!existing.contains(winInstall))
                 System.setProperty("jna.library.path",
                         existing.isBlank() ? winInstall : existing + java.io.File.pathSeparator + winInstall);
-            }
         }
-
-        Tesseract tesseract = new Tesseract();
+        Tesseract t = new Tesseract();
         String dataPath = getOcrDataPath();
-        tesseract.setDatapath(dataPath);
-
-        // Use Spanish if available, otherwise fall back to English (digits are universal)
+        t.setDatapath(dataPath);
         String lang = new java.io.File(dataPath, "spa.traineddata").exists() ? "spa" : "eng";
-        log.info("Tesseract using language: {} (tessdata: {})", lang, dataPath);
-        tesseract.setLanguage(lang);
-        tesseract.setPageSegMode(6); // Assume uniform block of text
-        tesseract.setOcrEngineMode(1); // LSTM only
-        return tesseract;
+        log.info("Tesseract language: {} (tessdata: {})", lang, dataPath);
+        t.setLanguage(lang);
+        t.setPageSegMode(3);  // Auto page segmentation (better for full documents)
+        t.setOcrEngineMode(1);
+        return t;
     }
 
     private String getOcrDataPath() {
@@ -302,13 +392,13 @@ public class PdfParserAdapter implements PdfParserGateway {
                 "/usr/share/tesseract-ocr/4.00/tessdata",
                 "/usr/share/tessdata",
         };
-        for (String path : paths) {
-            if (path != null && new java.io.File(path).exists()) {
-                log.info("Tesseract tessdata path resolved to: {}", path);
-                return path;
+        for (String p : paths) {
+            if (p != null && new java.io.File(p).exists()) {
+                log.info("Tesseract tessdata: {}", p);
+                return p;
             }
         }
-        log.warn("No known Tesseract tessdata path found, defaulting to /usr/share/tesseract-ocr/5/tessdata");
+        log.warn("No tessdata path found; defaulting to /usr/share/tesseract-ocr/5/tessdata");
         return "/usr/share/tesseract-ocr/5/tessdata";
     }
 }

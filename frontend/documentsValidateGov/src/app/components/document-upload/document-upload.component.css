@@ -347,6 +347,10 @@ h1 {
   border-color: rgba(245, 158, 11, 0.3);
 }
 
+.result-card.status-alert {
+  border-color: rgba(251, 146, 60, 0.5);
+}
+
 .result-header {
   padding: 1rem 1.25rem 0;
 }
@@ -375,6 +379,11 @@ h1 {
 .result-status-badge.status-error {
   background: rgba(245, 158, 11, 0.15);
   color: #fbbf24;
+}
+
+.result-status-badge.status-alert {
+  background: rgba(251, 146, 60, 0.15);
+  color: #fb923c;
 }
 
 .status-icon {
@@ -501,6 +510,11 @@ h1 {
 .table-badge.status-error {
   background: rgba(245, 158, 11, 0.15);
   color: #fbbf24;
+}
+
+.table-badge.status-alert {
+  background: rgba(251, 146, 60, 0.15);
+  color: #fb923c;
 }
 
 /* ============ LOADING OVERLAY ============ */

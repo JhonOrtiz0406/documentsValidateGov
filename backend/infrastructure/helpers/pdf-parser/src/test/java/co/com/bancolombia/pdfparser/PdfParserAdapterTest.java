@@ -1,5 +1,6 @@
 package co.com.bancolombia.pdfparser;
 
+import co.com.bancolombia.model.document.PinExtractionResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -25,138 +26,145 @@ class PdfParserAdapterTest {
 
     // ======================== PIN Pattern Matching Tests ========================
 
-    @ParameterizedTest(name = "Pattern match: \"{0}\" -> {1}")
+    @ParameterizedTest(name = "Label pattern: \"{0}\" -> {1}")
     @CsvSource({
             "'Certificado generado con el Pin No: 2602202649129843602', 2602202649129843602",
-            "'CertificadogeneradoconelPinNo:2602202649129843602', 2602202649129843602",
             "'Certificado generado con el Pin No:2602202649129843602', 2602202649129843602",
-            "'Certificado generado con el Pin No : 2602202649129843602', 2602202649129843602",
+            "'CertificadogeneradoconelPinNo:2602202649129843602', 2602202649129843602",
             "'certificado generado con el pin no: 2602202649129843602', 2602202649129843602",
             "'Pin No: 2602202649129843602', 2602202649129843602",
             "'Pin No:2602202649129843602', 2602202649129843602",
+            "'PinNo:2602202649129843602', 2602202649129843602",
+            "'PIN No: 2602202649129843602', 2602202649129843602",
+            "'Pin N°: 2602202649129843602', 2602202649129843602",
+            "'Pin N°2602202649129843602', 2602202649129843602",
+            "'PIN: 2602202649129843602', 2602202649129843602",
     })
-    void shouldExtractPinFromCleanText(String text, String expectedPin) {
-        String result = adapter.findPinInText(text, false);
-        assertNotNull(result, "PIN should be found in text: " + text);
+    void shouldExtractPinFromLabeledText(String text, String expectedPin) {
+        String result = adapter.findBestPinInText(text, false);
+        assertNotNull(result, "PIN should be found in: " + text);
         assertEquals(expectedPin, result);
+    }
+
+    @ParameterizedTest(name = "Split PIN: \"{0}\" -> {1}")
+    @CsvSource({
+            "'Pin No: 230228528472928 1146', 2302285284729281146",
+            "'Pin No: 230228528472928\t1146', 2302285284729281146",
+    })
+    void shouldMergePinSplitByWhitespace(String text, String expectedPin) {
+        String result = adapter.findBestPinInText(text, false);
+        assertEquals(expectedPin, result, "PIN split by whitespace should merge correctly");
     }
 
     @Test
     void shouldMergePinSplitAcrossLines() {
-        // PIN displayed on two lines in the PDF: first 15 digits, then 4 more on the next line
         String text = "Certificado generado con el Pin No: 230228528472928\n1146";
-        String result = adapter.findPinInText(text, false);
-        assertEquals("2302285284729281146", result,
-                "PIN split across lines should be merged into a single 19-digit PIN");
+        assertEquals("2302285284729281146", adapter.findBestPinInText(text, false));
     }
 
     @Test
-    void shouldMergePinSplitAcrossLinesWithCarriageReturn() {
+    void shouldMergePinSplitByCrlf() {
         String text = "Pin No: 230228528472928\r\n1146";
-        String result = adapter.findPinInText(text, false);
-        assertEquals("2302285284729281146", result,
-                "PIN split with CRLF should be merged correctly");
-    }
-
-    @ParameterizedTest(name = "OCR pattern match: \"{0}\" -> {1}")
-    @CsvSource({
-            "'C e r t i f i c a d o generado con el Pin No: 2602202649129843602', 2602202649129843602",
-            "'Certificado generado con el P i n N o : 2602202649129843602', 2602202649129843602",
-    })
-    void shouldExtractPinFromOcrText(String text, String expectedPin) {
-        String result = adapter.findPinInText(text, true);
-        assertNotNull(result, "PIN should be found in OCR text: " + text);
-        assertEquals(expectedPin, result);
+        assertEquals("2302285284729281146", adapter.findBestPinInText(text, false));
     }
 
     @Test
     void shouldNotExtractPinFromIrrelevantText() {
-        String text = "Este es un documento genérico que no contiene certificados ni PINes.";
-        String result = adapter.findPinInText(text, false);
-        assertNull(result, "Should not find PIN in irrelevant text");
+        assertNull(adapter.findBestPinInText(
+                "Documento genérico sin certificados ni PINes.", false));
     }
 
     @Test
-    void shouldHandleNullText() {
-        assertNull(adapter.findPinInText(null, false));
+    void shouldHandleNullAndBlank() {
+        assertNull(adapter.findBestPinInText(null, false));
+        assertNull(adapter.findBestPinInText("", false));
+        assertNull(adapter.findBestPinInText("   ", false));
+    }
+
+    // ======================== Multi-page conflict detection ========================
+
+    @Test
+    void shouldReturnSingleResultWhenAllPagesAgreePinNoConflict() {
+        // Two pages, same PIN → no conflict
+        PinExtractionResult r1 = PinExtractionResult.single("2602202649129843602");
+        assertFalse(r1.hasConflict());
+        assertEquals("2602202649129843602", r1.primaryPin());
+        assertEquals(1, r1.pins().size());
     }
 
     @Test
-    void shouldHandleEmptyText() {
-        assertNull(adapter.findPinInText("", false));
+    void shouldReturnConflictWhenPagesHaveDifferentPins() {
+        PinExtractionResult conflict = PinExtractionResult.conflict(
+                java.util.List.of("2602202649129843602", "2302285284729281146"));
+        assertTrue(conflict.hasConflict());
+        assertEquals(2, conflict.pins().size());
+        assertEquals("2602202649129843602", conflict.primaryPin());
     }
 
-    // ======================== Real PDF Tests (text extraction) ========================
-
-    @Test
-    void shouldExtractPinFromLeonardoPdf() throws IOException {
-        byte[] pdfBytes = loadTestPdf(
-                "LEONARDO DAVID TORRES CAMPO - CERTIFICADO DE LIBERTAD Y TRADICIÓN.pdf");
-        if (pdfBytes == null) return;
-
-        StepVerifier.create(adapter.extractPin(pdfBytes))
-                .assertNext(pin -> {
-                    assertNotNull(pin, "Should extract PIN from Leonardo's certificate");
-                    assertTrue(pin.matches("\\d{10,25}"),
-                            "PIN should be a long numeric string, got: " + pin);
-                    System.out.println("Leonardo PDF -> PIN: " + pin);
-                })
-                .verifyComplete();
-    }
+    // ======================== Real PDF Tests ========================
 
     @Test
     void shouldExtractPinFromKarenPdf() throws IOException {
-        byte[] pdfBytes = loadTestPdf(
-                "KAREN PATRICIA MOVILLA CABALLERO - CERTIFICADO DE LIBERTAD Y TRADICIÓN.pdf");
-        if (pdfBytes == null) return;
+        byte[] pdf = loadTestPdf("KAREN PATRICIA MOVILLA CABALLERO - CERTIFICADO DE LIBERTAD Y TRADICIÓN.pdf");
+        if (pdf == null) return;
 
-        StepVerifier.create(adapter.extractPin(pdfBytes))
-                .assertNext(pin -> {
-                    assertNotNull(pin, "Should extract PIN from Karen's certificate");
-                    assertTrue(pin.matches("\\d{10,25}"),
-                            "PIN should be a long numeric string, got: " + pin);
-                    assertEquals("2602202649129843602", pin,
+        StepVerifier.create(adapter.extractPins(pdf))
+                .assertNext(result -> {
+                    assertFalse(result.hasConflict(), "Should not have PIN conflict");
+                    assertEquals("2602202649129843602", result.primaryPin(),
                             "Karen's certificate should have PIN 2602202649129843602");
-                    System.out.println("Karen PDF -> PIN: " + pin);
+                    System.out.println("Karen PDF -> " + result);
                 })
                 .verifyComplete();
     }
 
     @Test
-    void shouldHandleNischarPdf() throws IOException {
-        // Nischar's PDF is scanned - requires OCR (Tesseract)
-        // When Tesseract is not installed, extractPin returns Mono.empty() (null)
-        byte[] pdfBytes = loadTestPdf(
-                "NISCHAR MOGOLLON PUCHE - CERIFICADO DE LIBERTAD Y TRADICIÓN.pdf");
-        if (pdfBytes == null) return;
+    void shouldExtractPinFromLeonardoPdf() throws IOException {
+        byte[] pdf = loadTestPdf("LEONARDO DAVID TORRES CAMPO - CERTIFICADO DE LIBERTAD Y TRADICIÓN.pdf");
+        if (pdf == null) return;
 
-        StepVerifier.create(adapter.extractPin(pdfBytes).defaultIfEmpty("NOT_FOUND"))
-                .assertNext(pin -> {
-                    if ("NOT_FOUND".equals(pin)) {
-                        System.out.println("Nischar PDF -> No PIN found (OCR required, Tesseract may not be installed)");
+        StepVerifier.create(adapter.extractPins(pdf))
+                .assertNext(result -> {
+                    assertNotNull(result.primaryPin(), "PIN should be extracted");
+                    assertTrue(result.primaryPin().matches("\\d{10,25}"),
+                            "PIN should be numeric, got: " + result.primaryPin());
+                    System.out.println("Leonardo PDF -> " + result);
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    void shouldExtractPinFromYicethPdf() throws IOException {
+        byte[] pdf = loadTestPdf("YICETH CECILIA BARRERA MONTIEL- SOPORTE.pdf");
+        if (pdf == null) return;
+
+        StepVerifier.create(adapter.extractPins(pdf).defaultIfEmpty(PinExtractionResult.single("NOT_FOUND")))
+                .assertNext(result -> {
+                    if ("NOT_FOUND".equals(result.primaryPin())) {
+                        System.out.println("Yiceth PDF -> no PIN found (OCR may be needed)");
                     } else {
-                        assertTrue(pin.matches("\\d{10,25}"),
-                                "PIN should be a long numeric string, got: " + pin);
-                        System.out.println("Nischar PDF -> PIN: " + pin);
+                        assertEquals("2302285284729281146", result.primaryPin(),
+                                "Yiceth's certificate should have PIN 2302285284729281146, got: "
+                                        + result.primaryPin());
+                        System.out.println("Yiceth PDF -> " + result);
                     }
                 })
                 .verifyComplete();
     }
 
     @Test
-    void shouldHandleYicethPdf() throws IOException {
-        byte[] pdfBytes = loadTestPdf(
-                "YICETH CECILIA BARRERA MONTIEL- SOPORTE.pdf");
-        if (pdfBytes == null) return;
+    void shouldHandleNischarPdf() throws IOException {
+        byte[] pdf = loadTestPdf("NISCHAR MOGOLLON PUCHE - CERIFICADO DE LIBERTAD Y TRADICIÓN.pdf");
+        if (pdf == null) return;
 
-        StepVerifier.create(adapter.extractPin(pdfBytes).defaultIfEmpty("NOT_FOUND"))
-                .assertNext(pin -> {
-                    if ("NOT_FOUND".equals(pin)) {
-                        System.out.println("Yiceth PDF -> No PIN found (OCR may be needed)");
+        StepVerifier.create(adapter.extractPins(pdf).defaultIfEmpty(PinExtractionResult.single("NOT_FOUND")))
+                .assertNext(result -> {
+                    if ("NOT_FOUND".equals(result.primaryPin())) {
+                        System.out.println("Nischar PDF -> no PIN found (scanned, OCR required)");
                     } else {
-                        assertEquals("2302285284729281146", pin,
-                                "Yiceth's certificate should have PIN 2302285284729281146, got: " + pin);
-                        System.out.println("Yiceth PDF -> PIN: " + pin);
+                        assertTrue(result.primaryPin().matches("\\d{10,25}"),
+                                "PIN should be numeric, got: " + result.primaryPin());
+                        System.out.println("Nischar PDF -> " + result);
                     }
                 })
                 .verifyComplete();
@@ -164,16 +172,11 @@ class PdfParserAdapterTest {
 
     @Test
     void shouldHandleNonCertificatePdf() throws IOException {
-        // "retiro de cesantías" is a severance pay document, NOT a certificate
-        byte[] pdfBytes = loadTestPdf(
-                "retiro de cesantias de yoneida morales paez.pdf");
-        if (pdfBytes == null) return;
+        byte[] pdf = loadTestPdf("retiro de cesantias de yoneida morales paez.pdf");
+        if (pdf == null) return;
 
-        StepVerifier.create(adapter.extractPin(pdfBytes).defaultIfEmpty("NOT_FOUND"))
-                .assertNext(pin -> {
-                    System.out.println("Retiro Cesantías PDF -> PIN: " + pin
-                            + ("NOT_FOUND".equals(pin) ? " (correct: not a certificate)" : ""));
-                })
+        StepVerifier.create(adapter.extractPins(pdf).defaultIfEmpty(PinExtractionResult.single("NOT_FOUND")))
+                .assertNext(result -> System.out.println("Retiro Cesantías PDF -> " + result))
                 .verifyComplete();
     }
 
@@ -182,7 +185,7 @@ class PdfParserAdapterTest {
     private byte[] loadTestPdf(String filename) throws IOException {
         Path pdfPath = Paths.get(DATA_PRUEBA_DIR, filename);
         if (!Files.exists(pdfPath)) {
-            System.out.println("SKIP: Test PDF not found at " + pdfPath.toAbsolutePath());
+            System.out.println("SKIP: test PDF not found at " + pdfPath.toAbsolutePath());
             return null;
         }
         return Files.readAllBytes(pdfPath);
@@ -190,17 +193,12 @@ class PdfParserAdapterTest {
 
     private static String resolveDataPruebaPath() {
         String[] candidates = {
-                "dataPrueba",
-                "../dataPrueba",
-                "../../dataPrueba",
-                "../../../dataPrueba",
-                "../../../../dataPrueba",
+                "dataPrueba", "../dataPrueba", "../../dataPrueba",
+                "../../../dataPrueba", "../../../../dataPrueba",
                 "backend/dataPrueba",
         };
-        for (String candidate : candidates) {
-            if (Files.isDirectory(Paths.get(candidate))) {
-                return candidate;
-            }
+        for (String c : candidates) {
+            if (Files.isDirectory(Paths.get(c))) return c;
         }
         return "C:\\trabajos\\DocumentsValidate\\backend\\dataPrueba";
     }
