@@ -14,6 +14,7 @@ import reactor.core.publisher.Mono;
 
 import java.awt.*;
 import java.awt.image.BufferedImage;
+import java.awt.image.RescaleOp;
 import java.util.*;
 import java.util.List;
 import java.util.regex.Matcher;
@@ -38,7 +39,8 @@ public class PdfParserAdapter implements PdfParserGateway {
     // Captures digits optionally separated by spaces/tabs (PDFBox splits PDF text
     // elements with spaces; long numbers may also wrap across lines).
     // Post-processing: strip whitespace, validate as 10-25 pure digits.
-    private static final String DB = "(\\d[\\d \\t]{8,28}\\d)";
+    // Range widened to 35 interior chars to handle OCR output with many spaces.
+    private static final String DB = "(\\d[\\d \\t]{8,35}\\d)";
 
     // ── PIN-label patterns, most specific → least specific ───────────────────────
     private static final List<Pattern> LABELED = List.of(
@@ -64,6 +66,8 @@ public class PdfParserAdapter implements PdfParserGateway {
         Pattern.compile("(?i)Pin\\s*N[°º]\\s*[:\\-.]?\\s*" + DB),
 
         // ── C: bare "PIN:" label and Colombian document variants ─────────────────
+        // C0 – OCR splits "No" into "N o" or "N°" is misread: "Pin N o :" / "P i n N ° :"
+        Pattern.compile("(?i)P\\s*[iI1]\\s*[nN]\\s+[Nn]\\s*[°º]?\\s*[oO0]?\\s*[:\\-./]?\\s*" + DB),
         // C1 – "PIN:" / "Pin:" with separator
         Pattern.compile("(?i)P\\s*[iI1]\\s*[nN]\\s*[:\\-.]\\s*" + DB),
         // C2 – "Número de Pin:" / "Numero de pin:"
@@ -170,32 +174,45 @@ public class PdfParserAdapter implements PdfParserGateway {
     private PinExtractionResult tryOcrExtraction(PDDocument doc, int totalPages) {
         try {
             PDFRenderer renderer = new PDFRenderer(doc);
-            Tesseract tess = createTesseract();
+            Tesseract tess = createTesseract(3);
             int pagesToScan = Math.min(totalPages, 6);
 
             LinkedHashMap<Integer, String> certPagePins = new LinkedHashMap<>();
             String firstLabeledPin = null;
+            // Keep best OCR text per page for last-resort pass
+            Map<Integer, String> pageTexts = new LinkedHashMap<>();
 
             for (int i = 0; i < pagesToScan; i++) {
                 log.info("OCR page {}/{}", i + 1, pagesToScan);
-                String text = ocrPage(renderer, tess, i, 300);
-                if (text.isBlank()) continue;
 
-                logPageText(i + 1, text);
-
-                boolean isCert = isCertificatePage(text);
-
-                String pin = findWithLabeledPatterns(text, true);
-                if (pin == null && isCert) {
-                    // Retry at 600 DPI for better accuracy on blurry pages
-                    log.info("OCR: retrying page {} at 600 DPI", i + 1);
-                    text = ocrPage(renderer, tess, i, 600);
-                    pin = findWithLabeledPatterns(text, true);
-                    if (pin == null) pin = findWithFallback(text);
+                // Get 300-DPI text first for cert detection & logging
+                String text300 = ocrPage(renderer, tess, i, 300);
+                if (!text300.isBlank()) {
+                    logPageText(i + 1, text300);
+                    pageTexts.put(i + 1, text300);
                 }
 
+                // Multi-pass voting: extracts PIN from both 300 DPI and 600 DPI and
+                // picks the most reliable reading to reduce single-pass digit errors.
+                String pin = ocrPageWithVoting(renderer, tess, i, true);
+
+                // If voting changed text (alternate PSM), update pageTexts
+                // Re-fetch best available text for cert detection
+                String bestText = text300;
+                if (pin != null && text300.isBlank()) {
+                    // Alternate PSM found something — get its text
+                    String altText = ocrPageBestEffort(renderer, i, 300);
+                    if (!altText.isBlank()) {
+                        bestText = altText;
+                        pageTexts.put(i + 1, altText);
+                        if (text300.isBlank()) logPageText(i + 1, altText);
+                    }
+                }
+
+                boolean isCert = !bestText.isBlank() && isCertificatePage(bestText);
+
                 if (pin != null) {
-                    log.info("OCR page {} PIN: {}", i + 1, pin);
+                    log.info("OCR page {} voted PIN: {}", i + 1, pin);
                     if (isCert) certPagePins.put(i + 1, pin);
                     else if (firstLabeledPin == null) firstLabeledPin = pin;
                 }
@@ -204,11 +221,21 @@ public class PdfParserAdapter implements PdfParserGateway {
             if (!certPagePins.isEmpty()) return buildResult(certPagePins);
             if (firstLabeledPin != null) return PinExtractionResult.single(firstLabeledPin);
 
-            // Last resort: OCR all pages combined
+            // Last resort: scan all collected OCR text; bypass cert-page gate since
+            // OCR may have missed keywords on real certificate pages.
+            log.info("OCR last-resort pass over {} pages of collected text", pageTexts.size());
             StringBuilder all = new StringBuilder();
-            for (int i = 0; i < pagesToScan; i++)
-                all.append(ocrPage(renderer, tess, i, 300)).append("\n");
-            String pin = findBestPinInText(all.toString(), true);
+            pageTexts.values().forEach(t -> all.append(t).append("\n"));
+            if (all.length() == 0) {
+                // Nothing from default tess — try best-effort multi-PSM on all pages
+                for (int i = 0; i < pagesToScan; i++) {
+                    String t = ocrPageBestEffort(renderer, i, 300);
+                    all.append(t).append("\n");
+                }
+            }
+            String allText = all.toString();
+            String pin = findWithLabeledPatterns(allText, true);
+            if (pin == null) pin = findWithFallback(allText); // no cert-page gate
             return pin != null ? PinExtractionResult.single(pin) : null;
 
         } catch (Throwable e) {
@@ -225,6 +252,112 @@ public class PdfParserAdapter implements PdfParserGateway {
             log.warn("OCR failed page {} at {} DPI: {}", idx + 1, dpi, e.getMessage());
             return "";
         }
+    }
+
+    /**
+     * Try multiple Tesseract PSM modes on a page. Returns the first text that
+     * yields a PIN, or the longest non-empty text as a fallback.
+     * PSM 3 = auto (best for mixed layouts)
+     * PSM 6 = uniform block of text (good for forms/certificates)
+     * PSM 4 = single column (good for documents with headers)
+     * PSM 11 = sparse text (good when text is scattered on scanned images)
+     */
+    private String ocrPageBestEffort(PDFRenderer renderer, int idx, int dpi) {
+        int[] psmModes = {3, 6, 4, 11};
+        String longestText = "";
+        for (int psm : psmModes) {
+            try {
+                Tesseract t = createTesseract(psm);
+                String text = ocrPage(renderer, t, idx, dpi);
+                if (!text.isBlank()) {
+                    // If this PSM already yields a PIN, use it immediately
+                    String pin = findWithLabeledPatterns(text, true);
+                    if (pin == null) pin = findWithFallback(text);
+                    if (pin != null) {
+                        log.info("OCR page {} PSM {} at {}dpi found PIN: {}", idx + 1, psm, dpi, pin);
+                        return text;
+                    }
+                    if (text.length() > longestText.length()) longestText = text;
+                }
+            } catch (Exception e) {
+                log.warn("OCR PSM {} page {} at {}dpi failed: {}", psm, idx + 1, dpi, e.getMessage());
+            }
+        }
+        return longestText;
+    }
+
+    /**
+     * OCR with 3-pass voting: runs at 300, 400, and 600 DPI; collects PIN candidates
+     * from each pass and selects the most plausible result.
+     *
+     * <ul>
+     *   <li>Candidates that are OCR variants of each other (edit distance ≤ 2) are
+     *       resolved by {@link #selectBestPin}: prefers pins in the expected SNR range
+     *       (19-22 digits); among those, prefers the shortest (fewer insertions).</li>
+     *   <li>If all DPI passes fail, escalates to alternate Tesseract PSM modes.</li>
+     * </ul>
+     */
+    private String ocrPageWithVoting(PDFRenderer renderer, Tesseract tess,
+                                     int idx, boolean isOcr) {
+        String text300 = ocrPage(renderer, tess, idx, 300);
+        String pin300  = findWithLabeledPatterns(text300, isOcr);
+        if (pin300 == null) pin300 = findWithFallback(text300);
+
+        // 400 DPI (no extra x2 scaling) — different interpolation path, different error
+        String text400 = ocrPage(renderer, tess, idx, 400);
+        String pin400  = findWithLabeledPatterns(text400, isOcr);
+        if (pin400 == null) pin400 = findWithFallback(text400);
+
+        String text600 = ocrPage(renderer, tess, idx, 600);
+        String pin600  = findWithLabeledPatterns(text600, isOcr);
+        if (pin600 == null) pin600 = findWithFallback(text600);
+
+        log.info("OCR voting page {}: 300dpi={} | 400dpi={} | 600dpi={}", idx + 1, pin300, pin400, pin600);
+
+        // Collect non-null candidates and select the best
+        List<String> candidates = new ArrayList<>();
+        if (pin300 != null) candidates.add(pin300);
+        if (pin400 != null) candidates.add(pin400);
+        if (pin600 != null) candidates.add(pin600);
+
+        // If all passes failed, try alternate PSM modes before giving up
+        if (candidates.isEmpty()) {
+            log.info("OCR voting page {}: all DPI passes yielded no PIN, trying alternate PSMs", idx + 1);
+            String altText = ocrPageBestEffort(renderer, idx, 300);
+            if (!altText.isBlank()) {
+                String altPin = findWithLabeledPatterns(altText, isOcr);
+                if (altPin == null) altPin = findWithFallback(altText);
+                if (altPin != null) {
+                    log.info("OCR page {} alternate PSM found PIN: {}", idx + 1, altPin);
+                }
+                return altPin;
+            }
+            return null;
+        }
+
+        if (candidates.size() == 1) return candidates.get(0);
+
+        // Deduplicate: if all candidates are OCR variants of the same number, pick best
+        String best = selectBestPin(candidates);
+        boolean allVariants = candidates.stream()
+                .allMatch(p -> Math.abs(p.length() - best.length()) <= 2
+                        && editDistance(p, best) <= 2);
+        if (allVariants) {
+            log.info("OCR voting page {}: candidates {} → best={}", idx + 1, candidates, best);
+            return best;
+        }
+
+        // Genuinely different readings — prefer whichever is in the expected length range
+        List<String> inRange = candidates.stream()
+                .filter(p -> p.length() >= 19 && p.length() <= 22)
+                .sorted(Comparator.comparingInt(String::length))
+                .collect(java.util.stream.Collectors.toList());
+        if (!inRange.isEmpty()) {
+            log.info("OCR voting page {}: differing readings, picking in-range: {}", idx + 1, inRange.get(0));
+            return inRange.get(0);
+        }
+
+        return best; // fallback: best by length heuristic
     }
 
     // ── Core PIN-extraction helpers ───────────────────────────────────────────────
@@ -254,21 +387,29 @@ public class PdfParserAdapter implements PdfParserGateway {
         return null;
     }
 
-    /** Fallback: find any 15-25 digit run; prefer 19-22 digits (typical SNR PIN). */
+    /** Fallback: find any 15-25 digit run; prefer 19-22 digits (typical SNR PIN).
+     *  When no candidate is in the ideal range, prefer the longest run (fewer deletions). */
     private String findWithFallback(String text) {
         String merged = mergeNewlineSplitDigits(text);
         Matcher m = FALLBACK.matcher(merged);
-        String best = null;
+        String bestInRange = null;
+        String bestAny = null;
         while (m.find()) {
             String c = m.group(1);
             if (c.length() >= 19 && c.length() <= 22) {
-                log.info("Fallback PIN ({} digits): {}", c.length(), c);
-                return c;
+                if (bestInRange == null || c.length() < bestInRange.length())
+                    bestInRange = c; // prefer shorter within range (fewer insertions)
+            } else if (c.length() >= 15) {
+                if (bestAny == null || c.length() > bestAny.length())
+                    bestAny = c; // prefer longer outside range (fewer deletions)
             }
-            if (best == null && c.length() >= 15) best = c;
         }
-        if (best != null) log.info("Fallback PIN (backup {} digits): {}", best.length(), best);
-        return best;
+        if (bestInRange != null) {
+            log.info("Fallback PIN ({} digits): {}", bestInRange.length(), bestInRange);
+            return bestInRange;
+        }
+        if (bestAny != null) log.info("Fallback PIN (backup {} digits): {}", bestAny.length(), bestAny);
+        return bestAny;
     }
 
     /**
@@ -303,12 +444,75 @@ public class PdfParserAdapter implements PdfParserGateway {
 
     private PinExtractionResult buildResult(LinkedHashMap<Integer, String> pagePins) {
         List<String> unique = new ArrayList<>(new LinkedHashSet<>(pagePins.values()));
+
         if (unique.size() == 1) {
             log.info("All certificate pages agree on PIN: {}", unique.get(0));
             return PinExtractionResult.single(unique.get(0));
         }
-        log.warn("CONFLICT: multiple PINs across pages: {}", unique);
+
+        // Check whether all "different" PINs are just OCR variants of the same number.
+        // OCR errors typically produce edit-distance ≤ 2 (1 wrong digit or 1 extra digit).
+        // If so, pick the most reliable candidate instead of declaring a false conflict.
+        String best = selectBestPin(unique);
+        boolean allVariants = unique.stream()
+                .allMatch(p -> Math.abs(p.length() - best.length()) <= 2
+                        && editDistance(p, best) <= 2);
+
+        if (allVariants) {
+            log.info("PINs {} look like OCR variants of the same number → selecting: {}",
+                    unique, best);
+            return PinExtractionResult.single(best);
+        }
+
+        log.warn("GENUINE CONFLICT: different PINs found across pages: {}", unique);
         return PinExtractionResult.conflict(unique);
+    }
+
+    /**
+     * Among OCR candidates, pick the most plausible PIN.
+     *
+     * Strategy:
+     * 1. Prefer any candidate whose length falls in the expected SNR PIN range (19-22).
+     *    Within that range, prefer the shortest (fewer OCR insertions).
+     * 2. If none is in-range, prefer the longest (fewer OCR deletions).
+     *
+     * This handles both error directions:
+     *  - OCR inserts a digit: candidates are e.g. 19 and 20 → both in range → pick 19 ✓
+     *  - OCR deletes a digit: candidates are e.g. 18 and 19 → only 19 in range → pick 19 ✓
+     */
+    private String selectBestPin(List<String> pins) {
+        List<String> inRange = pins.stream()
+                .filter(p -> p.length() >= 19 && p.length() <= 22)
+                .sorted(Comparator.comparingInt(String::length))
+                .collect(java.util.stream.Collectors.toList());
+        if (!inRange.isEmpty()) return inRange.get(0);
+
+        // No candidate in ideal range — prefer longer (deletion errors are common)
+        return pins.stream()
+                .filter(p -> p.length() >= 15)
+                .max(Comparator.comparingInt(String::length))
+                .orElse(pins.get(0));
+    }
+
+    /** Exposed for unit tests. */
+    int editDistancePublic(String a, String b) { return editDistance(a, b); }
+
+    /** Standard Levenshtein distance (space-optimised two-row DP). */
+    private int editDistance(String a, String b) {
+        int m = a.length(), n = b.length();
+        int[] prev = new int[n + 1];
+        int[] curr = new int[n + 1];
+        for (int j = 0; j <= n; j++) prev[j] = j;
+        for (int i = 1; i <= m; i++) {
+            curr[0] = i;
+            for (int j = 1; j <= n; j++) {
+                curr[j] = a.charAt(i - 1) == b.charAt(j - 1)
+                        ? prev[j - 1]
+                        : 1 + Math.min(prev[j - 1], Math.min(prev[j], curr[j - 1]));
+            }
+            int[] tmp = prev; prev = curr; curr = tmp;
+        }
+        return prev[n];
     }
 
     // ── Certificate-page detection ─────────────────────────────────────────────────
@@ -350,22 +554,51 @@ public class PdfParserAdapter implements PdfParserGateway {
 
     // ── Image preprocessing ────────────────────────────────────────────────────────
 
+    /**
+     * Prepares a page image for Tesseract OCR:
+     *
+     * <ol>
+     *   <li>Scale up 2× with bicubic interpolation — larger glyphs are easier to
+     *       classify correctly, especially for similar digits (5/6/8, 0/6, 1/7).</li>
+     *   <li>Convert to grayscale — Tesseract performs its own Otsu binarisation
+     *       internally, which is adaptive and outperforms a fixed global threshold.</li>
+     * </ol>
+     *
+     * We deliberately do NOT apply a hard binary threshold here because Java's
+     * {@code TYPE_BYTE_BINARY} uses a single global cutoff that can incorrectly
+     * merge similar-looking digits on low-contrast documents.
+     */
     private BufferedImage preprocessImage(BufferedImage src) {
-        int w = src.getWidth(), h = src.getHeight();
-        BufferedImage gray = new BufferedImage(w, h, BufferedImage.TYPE_BYTE_GRAY);
-        Graphics2D g = gray.createGraphics();
-        g.drawImage(src, 0, 0, null);
-        g.dispose();
-        BufferedImage bin = new BufferedImage(w, h, BufferedImage.TYPE_BYTE_BINARY);
-        Graphics2D g2 = bin.createGraphics();
-        g2.drawImage(gray, 0, 0, null);
-        g2.dispose();
-        return bin;
+        // Step 1 — scale up 2× for better per-glyph resolution
+        int sw = src.getWidth() * 2;
+        int sh = src.getHeight() * 2;
+        BufferedImage scaled = new BufferedImage(sw, sh, BufferedImage.TYPE_INT_RGB);
+        Graphics2D gs = scaled.createGraphics();
+        gs.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+        gs.setRenderingHint(RenderingHints.KEY_RENDERING,
+                RenderingHints.VALUE_RENDER_QUALITY);
+        gs.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
+                RenderingHints.VALUE_ANTIALIAS_ON);
+        gs.drawImage(src, 0, 0, sw, sh, null);
+        gs.dispose();
+
+        // Step 2 — convert to grayscale; let Tesseract do adaptive binarisation
+        BufferedImage gray = new BufferedImage(sw, sh, BufferedImage.TYPE_BYTE_GRAY);
+        Graphics2D gg = gray.createGraphics();
+        gg.drawImage(scaled, 0, 0, null);
+        gg.dispose();
+
+        // Step 3 — mild contrast boost (scale=1.3, offset=-20) to sharpen faded scans
+        // without clamping valid digit strokes. RescaleOp clamps to [0,255] automatically.
+        RescaleOp contrast = new RescaleOp(1.3f, -20f, null);
+        return contrast.filter(gray, gray);
     }
 
     // ── Tesseract setup ───────────────────────────────────────────────────────────
 
-    private Tesseract createTesseract() {
+    /** Creates a Tesseract instance with the given PSM (page segmentation mode). */
+    private Tesseract createTesseract(int psm) {
         String winInstall = "C:\\Program Files\\Tesseract-OCR";
         if (new java.io.File(winInstall).exists()) {
             String existing = System.getProperty("jna.library.path", "");
@@ -377,9 +610,8 @@ public class PdfParserAdapter implements PdfParserGateway {
         String dataPath = getOcrDataPath();
         t.setDatapath(dataPath);
         String lang = new java.io.File(dataPath, "spa.traineddata").exists() ? "spa" : "eng";
-        log.info("Tesseract language: {} (tessdata: {})", lang, dataPath);
         t.setLanguage(lang);
-        t.setPageSegMode(3);  // Auto page segmentation (better for full documents)
+        t.setPageSegMode(psm);
         t.setOcrEngineMode(1);
         return t;
     }

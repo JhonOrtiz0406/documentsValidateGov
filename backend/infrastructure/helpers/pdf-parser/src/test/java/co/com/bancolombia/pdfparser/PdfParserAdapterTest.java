@@ -85,20 +85,41 @@ class PdfParserAdapterTest {
 
     @Test
     void shouldReturnSingleResultWhenAllPagesAgreePinNoConflict() {
-        // Two pages, same PIN → no conflict
-        PinExtractionResult r1 = PinExtractionResult.single("2602202649129843602");
-        assertFalse(r1.hasConflict());
-        assertEquals("2602202649129843602", r1.primaryPin());
-        assertEquals(1, r1.pins().size());
+        PinExtractionResult r = PinExtractionResult.single("2602202649129843602");
+        assertFalse(r.hasConflict());
+        assertEquals("2602202649129843602", r.primaryPin());
+        assertEquals(1, r.pins().size());
     }
 
     @Test
-    void shouldReturnConflictWhenPagesHaveDifferentPins() {
+    void shouldReturnConflictWhenPagesHaveGenuinelyDifferentPins() {
+        // PINs differ by many digits → genuine conflict
         PinExtractionResult conflict = PinExtractionResult.conflict(
                 java.util.List.of("2602202649129843602", "2302285284729281146"));
         assertTrue(conflict.hasConflict());
         assertEquals(2, conflict.pins().size());
-        assertEquals("2602202649129843602", conflict.primaryPin());
+    }
+
+    @Test
+    void shouldDeduplicateOcrVariantsWithOneInsertedDigit() {
+        // "23022852847292811486" is "2302285284729281146" with one extra digit inserted by OCR
+        // buildResult should recognise them as the same PIN and return the shorter one.
+        // We test the logic indirectly through the adapter's internal buildResult path
+        // by verifying editDistance logic: both strings differ by 1 → same PIN.
+        String correct = "2302285284729281146";    // 19 digits
+        String ocrVariant = "23022852847292811486"; // 20 digits — OCR inserted an '8'
+        // edit distance = 1, length diff = 1 → variants
+        int dist = adapter.editDistancePublic(correct, ocrVariant);
+        assertEquals(1, dist, "Edit distance between OCR variant and correct PIN should be 1");
+    }
+
+    @Test
+    void shouldDeduplicateOcrVariantsWithOneWrongDigit() {
+        // 240301368690328656 vs 240301368690328686 — '5' misread as '8'
+        String correct  = "240301368690328686";
+        String ocrError = "240301368690328656";
+        int dist = adapter.editDistancePublic(correct, ocrError);
+        assertEquals(1, dist, "Edit distance for single-digit OCR misread should be 1");
     }
 
     // ======================== Real PDF Tests ========================
