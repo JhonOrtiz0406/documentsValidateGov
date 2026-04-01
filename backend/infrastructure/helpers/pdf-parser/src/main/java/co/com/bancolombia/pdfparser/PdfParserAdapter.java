@@ -5,7 +5,12 @@ import co.com.bancolombia.model.document.gateway.PdfParserGateway;
 import lombok.extern.slf4j.Slf4j;
 import net.sourceforge.tess4j.Tesseract;
 import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDResources;
+import org.apache.pdfbox.pdmodel.graphics.PDXObject;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.rendering.ImageType;
 import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
@@ -234,6 +239,72 @@ public class PdfParserAdapter implements PdfParserGateway {
                         if (pin != null) text300 = text600; // use for cert detection
                     }
                 }
+
+                // ── Rescue passes: only for pages where ALL prior passes returned blank ──
+                // The Yoneida document embeds pages at ~85 DPI (720×960 px); rendering at
+                // 300 DPI causes 3.5× interpolation artifacts. Rescue-E extracts the raw
+                // embedded image directly from the PDF page resources — bypassing rendering
+                // and avoiding double-scaling — and OCRs it at native resolution × 2.
+                // Other rescues try alternative preprocessing for colored-background pages.
+                boolean allPassesBlank = text300.isBlank(); // snapshot BEFORE rescues
+
+                if (allPassesBlank && pin == null) {
+                    // Rescue A: PSM 11 (sparse text) with preprocessed 300 DPI
+                    String rText = ocrPageRescuePsm(renderer, i, 300, 11);
+                    if (!rText.isBlank()) {
+                        log.info("Rescue-A (PSM 11) page {} {} chars", i + 1, rText.length());
+                        logPageText(i + 1, rText);
+                        pageTexts.put(i + 1, rText); text300 = rText;
+                        pin = findWithLabeledPatterns(rText, true);
+                        if (pin == null) pin = findWithFallback(rText);
+                    }
+                }
+
+                if (allPassesBlank && pin == null) {
+                    // Rescue B: direct RGB color (Tesseract's own adaptive binarization)
+                    String rText = ocrPageColor(renderer, i, 300);
+                    if (!rText.isBlank()) {
+                        log.info("Rescue-B (color) page {} {} chars", i + 1, rText.length());
+                        if (text300.isBlank()) { logPageText(i + 1, rText); pageTexts.put(i + 1, rText); text300 = rText; }
+                        pin = findWithLabeledPatterns(rText, true);
+                        if (pin == null) pin = findWithFallback(rText);
+                    }
+                }
+
+                if (allPassesBlank && pin == null) {
+                    // Rescue C: brightened preprocessing (scale=2.0, offset=+60)
+                    String rText = ocrPageBrightened(renderer, i, 300);
+                    if (!rText.isBlank()) {
+                        log.info("Rescue-C (bright) page {} {} chars", i + 1, rText.length());
+                        if (text300.isBlank()) { logPageText(i + 1, rText); pageTexts.put(i + 1, rText); text300 = rText; }
+                        pin = findWithLabeledPatterns(rText, true);
+                        if (pin == null) pin = findWithFallback(rText);
+                    }
+                }
+
+                if (allPassesBlank && pin == null) {
+                    // Rescue D: brightened + PSM 6 at 400 DPI
+                    String rText = ocrPageBrightenedPsm(renderer, i, 400, 6);
+                    if (!rText.isBlank()) {
+                        log.info("Rescue-D (bright PSM6 400dpi) page {} {} chars", i + 1, rText.length());
+                        if (text300.isBlank()) { logPageText(i + 1, rText); pageTexts.put(i + 1, rText); text300 = rText; }
+                        pin = findWithLabeledPatterns(rText, true);
+                        if (pin == null) pin = findWithFallback(rText);
+                    }
+                }
+
+                if (allPassesBlank && pin == null) {
+                    // Rescue E: extract embedded image XObject directly from PDF page —
+                    // avoids rendering artifacts from PDFBox scaling low-DPI source images.
+                    String rText = ocrPageEmbeddedImage(doc, i);
+                    if (!rText.isBlank()) {
+                        log.info("Rescue-E (embedded img) page {} {} chars", i + 1, rText.length());
+                        if (text300.isBlank()) { logPageText(i + 1, rText); pageTexts.put(i + 1, rText); text300 = rText; }
+                        pin = findWithLabeledPatterns(rText, true);
+                        if (pin == null) pin = findWithFallback(rText);
+                    }
+                }
+
                 log.info("OCR page {}: PIN={}", i + 1, pin);
 
                 boolean isCert = !text300.isBlank() && isCertificatePage(text300);
@@ -283,6 +354,136 @@ public class PdfParserAdapter implements PdfParserGateway {
             log.warn("OCR failed page {} at {} DPI: {}", idx + 1, dpi, e.getMessage());
             return "";
         }
+    }
+
+    /** Rescue A: PSM-mode variant with preprocessed image. */
+    private String ocrPageRescuePsm(PDFRenderer renderer, int idx, int dpi, int psm) {
+        try {
+            Tesseract t = createTesseract(psm);
+            BufferedImage img = renderer.renderImageWithDPI(idx, dpi, ImageType.RGB);
+            return t.doOCR(preprocessImage(img));
+        } catch (Exception e) {
+            log.warn("Rescue PSM{} failed page {} at {} DPI: {}", psm, idx + 1, dpi, e.getMessage());
+            return "";
+        }
+    }
+
+    /** Rescue B: pass color (RGB) image directly — Tesseract handles its own binarization. */
+    private String ocrPageColor(PDFRenderer renderer, int idx, int dpi) {
+        try {
+            Tesseract t = createTesseract(3);
+            BufferedImage img = renderer.renderImageWithDPI(idx, dpi, ImageType.RGB);
+            return t.doOCR(img); // no preprocessing — let Tesseract do adaptive binarization
+        } catch (Exception e) {
+            log.warn("Rescue color failed page {} at {} DPI: {}", idx + 1, dpi, e.getMessage());
+            return "";
+        }
+    }
+
+    /** Rescue C: brightened grayscale — scale=2.0, offset=+60 to surface faint text. */
+    private String ocrPageBrightened(PDFRenderer renderer, int idx, int dpi) {
+        try {
+            Tesseract t = createTesseract(3);
+            BufferedImage img = renderer.renderImageWithDPI(idx, dpi, ImageType.RGB);
+            return t.doOCR(preprocessBrightened(img));
+        } catch (Exception e) {
+            log.warn("Rescue bright failed page {} at {} DPI: {}", idx + 1, dpi, e.getMessage());
+            return "";
+        }
+    }
+
+    /** Rescue D: brightened + specific PSM at custom DPI. */
+    private String ocrPageBrightenedPsm(PDFRenderer renderer, int idx, int dpi, int psm) {
+        try {
+            Tesseract t = createTesseract(psm);
+            BufferedImage img = renderer.renderImageWithDPI(idx, dpi, ImageType.RGB);
+            return t.doOCR(preprocessBrightened(img));
+        } catch (Exception e) {
+            log.warn("Rescue bright PSM{} failed page {} at {} DPI: {}", psm, idx + 1, dpi, e.getMessage());
+            return "";
+        }
+    }
+
+    /**
+     * Rescue E: extract the largest embedded image XObject from the PDF page directly.
+     *
+     * <p>Pages that embed scanned certificate images at ~85 DPI (e.g. 720×960 px) lose
+     * quality when PDFBox renders them at 300 DPI (3.5× interpolation). Extracting the
+     * raw image bypasses that scaling, giving Tesseract the native pixel data with only
+     * a clean 2× upscale applied by us.</p>
+     *
+     * <p>Multiple XObjects per page are handled by picking the largest by pixel area,
+     * which is almost always the main certificate body image.</p>
+     */
+    private String ocrPageEmbeddedImage(PDDocument doc, int pageIdx) {
+        try {
+            PDPage page = doc.getPage(pageIdx);
+            PDResources resources = page.getResources();
+            BufferedImage largest = null;
+            int largestArea = 0;
+
+            for (COSName name : resources.getXObjectNames()) {
+                try {
+                    PDXObject xObj = resources.getXObject(name);
+                    if (xObj instanceof PDImageXObject imgXObj) {
+                        BufferedImage img = imgXObj.getImage();
+                        int area = img.getWidth() * img.getHeight();
+                        if (area > largestArea) {
+                            largestArea = area;
+                            largest = img;
+                        }
+                    }
+                } catch (Exception inner) {
+                    log.debug("XObject {} page {}: {}", name, pageIdx + 1, inner.getMessage());
+                }
+            }
+
+            if (largest == null) {
+                log.info("Rescue-E page {}: no embedded image XObject found", pageIdx + 1);
+                return "";
+            }
+
+            log.info("Rescue-E page {}: embedded image {}×{} px", pageIdx + 1, largest.getWidth(), largest.getHeight());
+            BufferedImage scaled = scaleImage2x(largest);
+
+            // Try PSM 3 first (auto), then PSM 6 (single block), then PSM 11 (sparse)
+            for (int psm : new int[]{3, 6, 11}) {
+                Tesseract t = createTesseract(psm);
+                String text = t.doOCR(scaled);
+                if (!text.isBlank()) {
+                    String pin = findWithLabeledPatterns(text, true);
+                    if (pin == null) pin = findWithFallback(text);
+                    if (pin != null) {
+                        log.info("Rescue-E PSM{} page {} found PIN: {}", psm, pageIdx + 1, pin);
+                        return text;
+                    }
+                    // Keep trying other PSMs — maybe one produces better text
+                    log.debug("Rescue-E PSM{} page {}: {} chars, no PIN", psm, pageIdx + 1, text.length());
+                }
+            }
+
+            // Last attempt: preprocessed (contrast boost) on the extracted image
+            Tesseract tPre = createTesseract(3);
+            String textPre = tPre.doOCR(preprocessImage(largest));
+            if (!textPre.isBlank()) return textPre;
+
+            return "";
+        } catch (Exception e) {
+            log.warn("Rescue-E (embedded image) page {}: {}", pageIdx + 1, e.getMessage());
+            return "";
+        }
+    }
+
+    /** Scale image 2× with bicubic interpolation (same as preprocessImage's step 1). */
+    private BufferedImage scaleImage2x(BufferedImage src) {
+        int w = src.getWidth() * 2, h = src.getHeight() * 2;
+        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = out.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+        g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+        g.drawImage(src, 0, 0, w, h, null);
+        g.dispose();
+        return out;
     }
 
     /** OCR with raw image — no 2x scaling, no contrast boost; just grayscale. */
@@ -591,6 +792,35 @@ public class PdfParserAdapter implements PdfParserGateway {
         // without clamping valid digit strokes. RescaleOp clamps to [0,255] automatically.
         RescaleOp contrast = new RescaleOp(1.3f, -20f, null);
         return contrast.filter(gray, gray);
+    }
+
+    /**
+     * Alternative preprocessing for dark/colored-background pages (Rescue C/D).
+     * Uses aggressive brightness boost (scale=2.0, offset=+60) instead of darkening,
+     * which can surface text that becomes invisible with the standard contrast-boost.
+     * Intended only for pages where standard preprocessing yields empty OCR output.
+     */
+    private BufferedImage preprocessBrightened(BufferedImage src) {
+        // Scale 2× (same as standard)
+        int sw = src.getWidth() * 2;
+        int sh = src.getHeight() * 2;
+        BufferedImage scaled = new BufferedImage(sw, sh, BufferedImage.TYPE_INT_RGB);
+        Graphics2D gs = scaled.createGraphics();
+        gs.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+        gs.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+        gs.drawImage(src, 0, 0, sw, sh, null);
+        gs.dispose();
+
+        // Convert to grayscale
+        BufferedImage gray = new BufferedImage(sw, sh, BufferedImage.TYPE_BYTE_GRAY);
+        Graphics2D gg = gray.createGraphics();
+        gg.drawImage(scaled, 0, 0, null);
+        gg.dispose();
+
+        // Aggressive brightness boost — lifts dark-background pages so text becomes
+        // legible for Tesseract's internal Otsu binarization.
+        RescaleOp bright = new RescaleOp(2.0f, 60f, null);
+        return bright.filter(gray, gray);
     }
 
     // ── Tesseract setup ───────────────────────────────────────────────────────────

@@ -192,12 +192,21 @@ class PdfParserAdapterTest {
     }
 
     @Test
-    void shouldHandleNonCertificatePdf() throws IOException {
+    void shouldDetectPinConflictInYoneidaCesantiasPdf() throws IOException {
         byte[] pdf = loadTestPdf("retiro de cesantias de yoneida morales paez.pdf");
         if (pdf == null) return;
 
-        StepVerifier.create(adapter.extractPins(pdf).defaultIfEmpty(PinExtractionResult.single("NOT_FOUND")))
-                .assertNext(result -> System.out.println("Retiro Cesantías PDF -> " + result))
+        StepVerifier.create(adapter.extractPins(pdf))
+                .assertNext(result -> {
+                    System.out.println("Retiro Cesantías PDF -> " + result);
+                    assertTrue(result.hasConflict(),
+                            "Yoneida document has multiple certificates with different PINs — should have conflict");
+                    assertTrue(result.pins().size() >= 2,
+                            "Expected at least 2 different PINs, got: " + result.pins());
+                    result.pins().forEach(pin ->
+                            assertTrue(pin.matches("\\d{10,25}"),
+                                    "Each PIN must be numeric (10-25 digits), got: " + pin));
+                })
                 .verifyComplete();
     }
 
