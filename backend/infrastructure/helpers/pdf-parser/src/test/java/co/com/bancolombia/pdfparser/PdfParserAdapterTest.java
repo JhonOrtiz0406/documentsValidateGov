@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -196,6 +197,11 @@ class PdfParserAdapterTest {
         byte[] pdf = loadTestPdf("retiro de cesantias de yoneida morales paez.pdf");
         if (pdf == null) return;
 
+        // Page 5 PIN: 2302285284729284123
+        // Page 6 PIN: 2302285284729284132
+        // Both are genuine different PINs (one per certificate page) — conflict expected.
+        List<String> expectedPins = List.of("2302285284729284123", "2302285284729284132");
+
         StepVerifier.create(adapter.extractPins(pdf))
                 .assertNext(result -> {
                     System.out.println("Retiro Cesantías PDF -> " + result);
@@ -206,6 +212,9 @@ class PdfParserAdapterTest {
                     result.pins().forEach(pin ->
                             assertTrue(pin.matches("\\d{10,25}"),
                                     "Each PIN must be numeric (10-25 digits), got: " + pin));
+                    List<String> extractedPins = result.pins();
+                    assertTrue(extractedPins.containsAll(expectedPins),
+                            "Expected PINs " + expectedPins + " but got: " + extractedPins);
                 })
                 .verifyComplete();
     }
