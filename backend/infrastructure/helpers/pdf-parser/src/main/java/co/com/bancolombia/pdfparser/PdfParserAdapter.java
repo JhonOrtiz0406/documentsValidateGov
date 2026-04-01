@@ -81,8 +81,12 @@ public class PdfParserAdapter implements PdfParserGateway {
         Pattern.compile("(?i)pin[^\\d\\n]{0,30}\\n[ \\t]*" + DB)
     );
 
-    // Fallback: raw 15-25 digit run — only on confirmed certificate pages
+    // Fallback: pure digit run, used after merging newlines (cert pages only in text mode)
     private static final Pattern FALLBACK = Pattern.compile("(\\d{15,25})");
+
+    // OCR fallback: digit run allowing embedded spaces/tabs (OCR splits digits with spaces)
+    // Captures e.g. "2302285 284729281146" → strip spaces → "2302285284729281146"
+    private static final Pattern FALLBACK_OCR = Pattern.compile("(\\d[\\d \\t]{13,35}\\d)");
 
     // ─────────────────────────────────────────────────────────────────────────────
 
@@ -118,10 +122,11 @@ public class PdfParserAdapter implements PdfParserGateway {
     private PinExtractionResult tryTextExtraction(PDDocument doc, int totalPages) throws Exception {
         PDFTextStripper stripper = new PDFTextStripper();
 
-        // cert pages → used for multi-page conflict detection
+        // cert pages → primary conflict detection
         LinkedHashMap<Integer, String> certPagePins = new LinkedHashMap<>();
-        // any page that has a labeled PIN (even non-cert) → used as fallback
-        String firstLabeledPin = null;
+        // ALL pages with any labeled PIN (cert + non-cert) — fallback conflict detection
+        // for mixed documents where cert-keyword detection may fail on some pages
+        LinkedHashMap<Integer, String> allLabeledPagePins = new LinkedHashMap<>();
 
         for (int page = 1; page <= totalPages; page++) {
             stripper.setStartPage(page);
@@ -142,10 +147,9 @@ public class PdfParserAdapter implements PdfParserGateway {
 
             if (pin != null) {
                 log.info("Page {} — labeled-pattern PIN: {}", page, pin);
+                allLabeledPagePins.put(page, pin); // always track
                 if (isCert) {
                     certPagePins.put(page, pin);
-                } else if (firstLabeledPin == null) {
-                    firstLabeledPin = pin;
                 }
             } else if (isCert) {
                 // Cert page but labeled pattern didn't match → try fallback digits
@@ -153,18 +157,21 @@ public class PdfParserAdapter implements PdfParserGateway {
                 if (pin != null) {
                     log.info("Page {} — fallback-digit PIN: {}", page, pin);
                     certPagePins.put(page, pin);
+                    allLabeledPagePins.put(page, pin);
                 } else {
                     log.warn("Page {} — cert page but no PIN extracted", page);
                 }
             }
         }
 
-        // Build result: cert-page conflict check takes priority
+        // Priority 1: cert pages (most reliable)
         if (!certPagePins.isEmpty()) {
             return buildResult(certPagePins);
         }
-        if (firstLabeledPin != null) {
-            return PinExtractionResult.single(firstLabeledPin);
+        // Priority 2: ALL labeled pages — catches conflicts on non-cert pages too
+        // (e.g. a mixed doc containing two different certificates without cert keywords)
+        if (!allLabeledPagePins.isEmpty()) {
+            return buildResult(allLabeledPagePins);
         }
         return null;
     }
@@ -175,55 +182,79 @@ public class PdfParserAdapter implements PdfParserGateway {
         try {
             PDFRenderer renderer = new PDFRenderer(doc);
             Tesseract tess = createTesseract(3);
-            int pagesToScan = Math.min(totalPages, 6);
+            int pagesToScan = Math.min(totalPages, 15);
 
             LinkedHashMap<Integer, String> certPagePins = new LinkedHashMap<>();
-            String firstLabeledPin = null;
+            // All pages with any labeled PIN (cert or not) — used for conflict detection
+            // when cert-keyword OCR fails but the PIN label is still readable.
+            LinkedHashMap<Integer, String> allLabeledPagePins = new LinkedHashMap<>();
             // Keep best OCR text per page for last-resort pass
             Map<Integer, String> pageTexts = new LinkedHashMap<>();
 
             for (int i = 0; i < pagesToScan; i++) {
                 log.info("OCR page {}/{}", i + 1, pagesToScan);
 
-                // Get 300-DPI text first for cert detection & logging
+                // Pass 1: preprocessed 300 DPI (also used for cert-page detection)
                 String text300 = ocrPage(renderer, tess, i, 300);
                 if (!text300.isBlank()) {
                     logPageText(i + 1, text300);
                     pageTexts.put(i + 1, text300);
                 }
 
-                // Multi-pass voting: extracts PIN from both 300 DPI and 600 DPI and
-                // picks the most reliable reading to reduce single-pass digit errors.
-                String pin = ocrPageWithVoting(renderer, tess, i, true);
+                // Try PIN in pass-1 text first (reuse already-computed OCR)
+                String pin = findWithLabeledPatterns(text300, true);
+                if (pin == null) pin = findWithFallback(text300);
 
-                // If voting changed text (alternate PSM), update pageTexts
-                // Re-fetch best available text for cert detection
-                String bestText = text300;
-                if (pin != null && text300.isBlank()) {
-                    // Alternate PSM found something — get its text
-                    String altText = ocrPageBestEffort(renderer, i, 300);
-                    if (!altText.isBlank()) {
-                        bestText = altText;
-                        pageTexts.put(i + 1, altText);
-                        if (text300.isBlank()) logPageText(i + 1, altText);
+                // Pass 2 only if pass 1 found nothing: raw 300 DPI with PSM 6
+                if (pin == null) {
+                    Tesseract tess6 = createTesseract(6);
+                    String textRaw = ocrPageRaw(renderer, tess6, i, 300);
+                    if (!textRaw.isBlank()) {
+                        if (text300.isBlank()) { logPageText(i + 1, textRaw); }
+                        pageTexts.put(i + 1, textRaw);
+                        pin = findWithLabeledPatterns(textRaw, true);
+                        if (pin == null) pin = findWithFallback(textRaw);
+                        if (pin != null) text300 = textRaw; // use for cert detection
                     }
                 }
 
-                boolean isCert = !bestText.isBlank() && isCertificatePage(bestText);
+                // Pass 3: if still nothing, retry at 600 DPI (raw, PSM 3).
+                // Scanned government docs embedded at ~150-180 DPI benefit from a
+                // higher-resolution render: more pixels per character allow Tesseract
+                // to resolve digit strokes that were too coarse at 300 DPI.
+                if (pin == null) {
+                    Tesseract tess600 = createTesseract(3);
+                    String text600 = ocrPageRaw(renderer, tess600, i, 600);
+                    if (!text600.isBlank()) {
+                        log.info("Pass-3 (600 DPI) page {} produced {} chars", i + 1, text600.length());
+                        if (text300.isBlank()) { logPageText(i + 1, text600); }
+                        if (!pageTexts.containsKey(i + 1)) pageTexts.put(i + 1, text600);
+                        pin = findWithLabeledPatterns(text600, true);
+                        if (pin == null) pin = findWithFallback(text600);
+                        if (pin != null) text300 = text600; // use for cert detection
+                    }
+                }
+                log.info("OCR page {}: PIN={}", i + 1, pin);
+
+                boolean isCert = !text300.isBlank() && isCertificatePage(text300);
 
                 if (pin != null) {
                     log.info("OCR page {} voted PIN: {}", i + 1, pin);
+                    allLabeledPagePins.put(i + 1, pin); // always track
                     if (isCert) certPagePins.put(i + 1, pin);
-                    else if (firstLabeledPin == null) firstLabeledPin = pin;
                 }
             }
 
+            // Priority 1: cert pages (most reliable source)
             if (!certPagePins.isEmpty()) return buildResult(certPagePins);
-            if (firstLabeledPin != null) return PinExtractionResult.single(firstLabeledPin);
+            // Priority 2: ALL labeled pages — handles docs where cert keywords were
+            // garbled by OCR but PIN labels are still readable (e.g. Yoneida scenario).
+            if (!allLabeledPagePins.isEmpty()) return buildResult(allLabeledPagePins);
 
             // Last resort: scan all collected OCR text; bypass cert-page gate since
             // OCR may have missed keywords on real certificate pages.
-            log.info("OCR last-resort pass over {} pages of collected text", pageTexts.size());
+            log.info("OCR last-resort: scanned {}/{} pages, got text on {} pages",
+                    pagesToScan, totalPages, pageTexts.size());
             StringBuilder all = new StringBuilder();
             pageTexts.values().forEach(t -> all.append(t).append("\n"));
             if (all.length() == 0) {
@@ -254,110 +285,57 @@ public class PdfParserAdapter implements PdfParserGateway {
         }
     }
 
+    /** OCR with raw image — no 2x scaling, no contrast boost; just grayscale. */
+    private String ocrPageRaw(PDFRenderer renderer, Tesseract tess, int idx, int dpi) {
+        try {
+            BufferedImage img = renderer.renderImageWithDPI(idx, dpi, ImageType.GRAY);
+            return tess.doOCR(img);
+        } catch (Exception e) {
+            log.warn("OCR-raw failed page {} at {} DPI: {}", idx + 1, dpi, e.getMessage());
+            return "";
+        }
+    }
+
     /**
-     * Try multiple Tesseract PSM modes on a page. Returns the first text that
-     * yields a PIN, or the longest non-empty text as a fallback.
-     * PSM 3 = auto (best for mixed layouts)
-     * PSM 6 = uniform block of text (good for forms/certificates)
-     * PSM 4 = single column (good for documents with headers)
-     * PSM 11 = sparse text (good when text is scattered on scanned images)
+     * Last-resort OCR: tries PSM 4 and PSM 11 with preprocessing, then raw.
+     * Called at most once per document (not per page), so 3 extra passes is acceptable.
      */
     private String ocrPageBestEffort(PDFRenderer renderer, int idx, int dpi) {
-        int[] psmModes = {3, 6, 4, 11};
         String longestText = "";
-        for (int psm : psmModes) {
+        for (int psm : new int[]{4, 11}) {
             try {
                 Tesseract t = createTesseract(psm);
                 String text = ocrPage(renderer, t, idx, dpi);
                 if (!text.isBlank()) {
-                    // If this PSM already yields a PIN, use it immediately
                     String pin = findWithLabeledPatterns(text, true);
                     if (pin == null) pin = findWithFallback(text);
                     if (pin != null) {
-                        log.info("OCR page {} PSM {} at {}dpi found PIN: {}", idx + 1, psm, dpi, pin);
+                        log.info("BestEffort page {} psm={} {}dpi found PIN: {}", idx + 1, psm, dpi, pin);
                         return text;
                     }
                     if (text.length() > longestText.length()) longestText = text;
                 }
             } catch (Exception e) {
-                log.warn("OCR PSM {} page {} at {}dpi failed: {}", psm, idx + 1, dpi, e.getMessage());
+                log.warn("BestEffort psm={} page {} failed: {}", psm, idx + 1, e.getMessage());
             }
+        }
+        // Raw pass as final attempt
+        try {
+            Tesseract tRaw = createTesseract(3);
+            String text = ocrPageRaw(renderer, tRaw, idx, dpi);
+            if (!text.isBlank()) {
+                String pin = findWithLabeledPatterns(text, true);
+                if (pin == null) pin = findWithFallback(text);
+                if (pin != null) {
+                    log.info("BestEffort page {} raw {}dpi found PIN: {}", idx + 1, dpi, pin);
+                    return text;
+                }
+                if (text.length() > longestText.length()) longestText = text;
+            }
+        } catch (Exception e) {
+            log.warn("BestEffort raw page {} failed: {}", idx + 1, e.getMessage());
         }
         return longestText;
-    }
-
-    /**
-     * OCR with 3-pass voting: runs at 300, 400, and 600 DPI; collects PIN candidates
-     * from each pass and selects the most plausible result.
-     *
-     * <ul>
-     *   <li>Candidates that are OCR variants of each other (edit distance ≤ 2) are
-     *       resolved by {@link #selectBestPin}: prefers pins in the expected SNR range
-     *       (19-22 digits); among those, prefers the shortest (fewer insertions).</li>
-     *   <li>If all DPI passes fail, escalates to alternate Tesseract PSM modes.</li>
-     * </ul>
-     */
-    private String ocrPageWithVoting(PDFRenderer renderer, Tesseract tess,
-                                     int idx, boolean isOcr) {
-        String text300 = ocrPage(renderer, tess, idx, 300);
-        String pin300  = findWithLabeledPatterns(text300, isOcr);
-        if (pin300 == null) pin300 = findWithFallback(text300);
-
-        // 400 DPI (no extra x2 scaling) — different interpolation path, different error
-        String text400 = ocrPage(renderer, tess, idx, 400);
-        String pin400  = findWithLabeledPatterns(text400, isOcr);
-        if (pin400 == null) pin400 = findWithFallback(text400);
-
-        String text600 = ocrPage(renderer, tess, idx, 600);
-        String pin600  = findWithLabeledPatterns(text600, isOcr);
-        if (pin600 == null) pin600 = findWithFallback(text600);
-
-        log.info("OCR voting page {}: 300dpi={} | 400dpi={} | 600dpi={}", idx + 1, pin300, pin400, pin600);
-
-        // Collect non-null candidates and select the best
-        List<String> candidates = new ArrayList<>();
-        if (pin300 != null) candidates.add(pin300);
-        if (pin400 != null) candidates.add(pin400);
-        if (pin600 != null) candidates.add(pin600);
-
-        // If all passes failed, try alternate PSM modes before giving up
-        if (candidates.isEmpty()) {
-            log.info("OCR voting page {}: all DPI passes yielded no PIN, trying alternate PSMs", idx + 1);
-            String altText = ocrPageBestEffort(renderer, idx, 300);
-            if (!altText.isBlank()) {
-                String altPin = findWithLabeledPatterns(altText, isOcr);
-                if (altPin == null) altPin = findWithFallback(altText);
-                if (altPin != null) {
-                    log.info("OCR page {} alternate PSM found PIN: {}", idx + 1, altPin);
-                }
-                return altPin;
-            }
-            return null;
-        }
-
-        if (candidates.size() == 1) return candidates.get(0);
-
-        // Deduplicate: if all candidates are OCR variants of the same number, pick best
-        String best = selectBestPin(candidates);
-        boolean allVariants = candidates.stream()
-                .allMatch(p -> Math.abs(p.length() - best.length()) <= 2
-                        && editDistance(p, best) <= 2);
-        if (allVariants) {
-            log.info("OCR voting page {}: candidates {} → best={}", idx + 1, candidates, best);
-            return best;
-        }
-
-        // Genuinely different readings — prefer whichever is in the expected length range
-        List<String> inRange = candidates.stream()
-                .filter(p -> p.length() >= 19 && p.length() <= 22)
-                .sorted(Comparator.comparingInt(String::length))
-                .collect(java.util.stream.Collectors.toList());
-        if (!inRange.isEmpty()) {
-            log.info("OCR voting page {}: differing readings, picking in-range: {}", idx + 1, inRange.get(0));
-            return inRange.get(0);
-        }
-
-        return best; // fallback: best by length heuristic
     }
 
     // ── Core PIN-extraction helpers ───────────────────────────────────────────────
@@ -388,20 +366,33 @@ public class PdfParserAdapter implements PdfParserGateway {
     }
 
     /** Fallback: find any 15-25 digit run; prefer 19-22 digits (typical SNR PIN).
-     *  When no candidate is in the ideal range, prefer the longest run (fewer deletions). */
+     *  When no candidate is in the ideal range, prefer the longest run (fewer deletions).
+     *  For OCR text, also tries space-tolerant matching (OCR splits digits with spaces). */
     private String findWithFallback(String text) {
         String merged = mergeNewlineSplitDigits(text);
-        Matcher m = FALLBACK.matcher(merged);
+
+        String best = bestMatchInText(merged, FALLBACK, false);
+        if (best != null) return best;
+
+        // OCR may have inserted spaces inside digit sequences — try space-tolerant pattern
+        best = bestMatchInText(merged, FALLBACK_OCR, true);
+        return best;
+    }
+
+    private String bestMatchInText(String text, Pattern pat, boolean stripSpaces) {
+        Matcher m = pat.matcher(text);
         String bestInRange = null;
         String bestAny = null;
         while (m.find()) {
-            String c = m.group(1);
+            String raw = m.group(1);
+            String c = stripSpaces ? raw.replaceAll("[ \\t]+", "") : raw;
+            if (!c.matches("\\d+")) continue; // must be pure digits after strip
             if (c.length() >= 19 && c.length() <= 22) {
                 if (bestInRange == null || c.length() < bestInRange.length())
-                    bestInRange = c; // prefer shorter within range (fewer insertions)
+                    bestInRange = c;
             } else if (c.length() >= 15) {
                 if (bestAny == null || c.length() > bestAny.length())
-                    bestAny = c; // prefer longer outside range (fewer deletions)
+                    bestAny = c;
             }
         }
         if (bestInRange != null) {
@@ -451,12 +442,19 @@ public class PdfParserAdapter implements PdfParserGateway {
         }
 
         // Check whether all "different" PINs are just OCR variants of the same number.
-        // OCR errors typically produce edit-distance ≤ 2 (1 wrong digit or 1 extra digit).
-        // If so, pick the most reliable candidate instead of declaring a false conflict.
+        // Rules:
+        //  • Same length  → allow at most 1 substitution (edit-dist ≤ 1).
+        //    Two substitutions on the same-length number (e.g. "…23" vs "…32") almost
+        //    always means a genuine PIN difference, not an OCR glitch.
+        //  • Diff length  → allow up to 2 edits (insertion/deletion ± 1 substitution).
+        //    OCR commonly inserts or deletes a single digit on long number runs.
         String best = selectBestPin(unique);
         boolean allVariants = unique.stream()
-                .allMatch(p -> Math.abs(p.length() - best.length()) <= 2
-                        && editDistance(p, best) <= 2);
+                .allMatch(p -> {
+                    int lenDiff = Math.abs(p.length() - best.length());
+                    int ed      = editDistance(p, best);
+                    return lenDiff == 0 ? ed <= 1 : (lenDiff <= 2 && ed <= 2);
+                });
 
         if (allVariants) {
             log.info("PINs {} look like OCR variants of the same number → selecting: {}",
@@ -597,8 +595,8 @@ public class PdfParserAdapter implements PdfParserGateway {
 
     // ── Tesseract setup ───────────────────────────────────────────────────────────
 
-    /** Creates a Tesseract instance with the given PSM (page segmentation mode). */
-    private Tesseract createTesseract(int psm) {
+    /** Creates a Tesseract instance with the given PSM and OEM. */
+    private Tesseract createTesseract(int psm, int oem) {
         String winInstall = "C:\\Program Files\\Tesseract-OCR";
         if (new java.io.File(winInstall).exists()) {
             String existing = System.getProperty("jna.library.path", "");
@@ -609,11 +607,24 @@ public class PdfParserAdapter implements PdfParserGateway {
         Tesseract t = new Tesseract();
         String dataPath = getOcrDataPath();
         t.setDatapath(dataPath);
-        String lang = new java.io.File(dataPath, "spa.traineddata").exists() ? "spa" : "eng";
+        // Use spa+eng combo: catches Spanish labels while eng handles digits more reliably
+        boolean hasSpa = new java.io.File(dataPath, "spa.traineddata").exists();
+        boolean hasEng = new java.io.File(dataPath, "eng.traineddata").exists();
+        String lang = (hasSpa && hasEng) ? "spa+eng" : hasSpa ? "spa" : "eng";
+        log.debug("Tesseract psm={} oem={} lang={}", psm, oem, lang);
         t.setLanguage(lang);
         t.setPageSegMode(psm);
-        t.setOcrEngineMode(1);
+        t.setOcrEngineMode(oem);
+        // Override Tesseract's DPI auto-detection ("Estimating resolution as 1XX").
+        // Low DPI estimates cause incorrect character-size normalization on scanned
+        // government documents, leading to PIN=null even when text is readable.
+        t.setVariable("user_defined_dpi", "300");
         return t;
+    }
+
+    /** Convenience wrapper with default OEM 1 (LSTM). */
+    private Tesseract createTesseract(int psm) {
+        return createTesseract(psm, 1);
     }
 
     private String getOcrDataPath() {
