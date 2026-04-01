@@ -305,6 +305,13 @@ public class PdfParserAdapter implements PdfParserGateway {
                     }
                 }
 
+                // Digit-only refinement: re-OCR with whitelist=0-9 to fix common digit
+                // misreads (8→0, 2→7, etc.) that occur when Tesseract considers letters
+                // as alternatives to ambiguous digit strokes.
+                if (pin != null) {
+                    pin = refineWithDigitOnly(renderer, doc, i, pin);
+                }
+
                 log.info("OCR page {}: PIN={}", i + 1, pin);
 
                 boolean isCert = !text300.isBlank() && isCertificatePage(text300);
@@ -537,6 +544,119 @@ public class PdfParserAdapter implements PdfParserGateway {
             log.warn("BestEffort raw page {} failed: {}", idx + 1, e.getMessage());
         }
         return longestText;
+    }
+
+    // ── Digit-only refinement ─────────────────────────────────────────────────────
+
+    /**
+     * Re-OCR the page with a digit-only character whitelist to correct common digit
+     * misreads (e.g. 8→0, 2→7) that occur when Tesseract considers letters as valid
+     * alternatives to ambiguous digit strokes.
+     *
+     * <p>Strategy:
+     * <ol>
+     *   <li>Render the page at 300 DPI and run Tesseract with {@code tessedit_char_whitelist=0123456789}.</li>
+     *   <li>If the page has a low-DPI embedded image (Rescue-E scenario), also try the raw XObject.</li>
+     *   <li>Among all candidates of the same length, pick the one with minimum edit distance
+     *       to the input candidate.</li>
+     *   <li>Accept the refined PIN only if it is within 2 edits — meaning at most 2 digits
+     *       were corrected. This guards against picking up a completely different number
+     *       (e.g. page reference, date) by accident.</li>
+     * </ol>
+     * </p>
+     */
+    private String refineWithDigitOnly(PDFRenderer renderer, PDDocument doc, int pageIdx, String candidatePin) {
+        int expectedLen = candidatePin.length();
+        String best = null;
+        int bestDist = Integer.MAX_VALUE;
+
+        // Attempt 1: standard 300 DPI render with both PSM 6 and PSM 3
+        try {
+            BufferedImage img = renderer.renderImageWithDPI(pageIdx, 300, ImageType.RGB);
+            for (int psm : new int[]{6, 3}) {
+                try {
+                    Tesseract t = createTesseract(psm);
+                    t.setVariable("tessedit_char_whitelist", "0123456789");
+                    String text = t.doOCR(preprocessImage(img));
+                    String candidate = longestDigitRunOfLength(text, expectedLen);
+                    if (candidate != null) {
+                        int d = editDistance(candidate, candidatePin);
+                        if (d < bestDist) { bestDist = d; best = candidate; }
+                    }
+                } catch (Exception e) {
+                    log.debug("Digit-only PSM{} page {} failed: {}", psm, pageIdx + 1, e.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Digit-only render page {} failed: {}", pageIdx + 1, e.getMessage());
+        }
+
+        // Attempt 2: raw embedded image XObject (avoids PDFBox scaling artifacts on low-DPI scans)
+        try {
+            PDPage page = doc.getPage(pageIdx);
+            PDResources res = page.getResources();
+            BufferedImage largest = null;
+            int largestArea = 0;
+            for (COSName name : res.getXObjectNames()) {
+                try {
+                    PDXObject xObj = res.getXObject(name);
+                    if (xObj instanceof PDImageXObject imgXObj) {
+                        BufferedImage img = imgXObj.getImage();
+                        int area = img.getWidth() * img.getHeight();
+                        if (area > largestArea) { largestArea = area; largest = img; }
+                    }
+                } catch (Exception inner) {
+                    log.debug("XObject {} digit-only page {}: {}", name, pageIdx + 1, inner.getMessage());
+                }
+            }
+            if (largest != null) {
+                BufferedImage scaled = scaleImage2x(largest);
+                for (int psm : new int[]{6, 3}) {
+                    try {
+                        Tesseract t = createTesseract(psm);
+                        t.setVariable("tessedit_char_whitelist", "0123456789");
+                        String text = t.doOCR(scaled);
+                        String candidate = longestDigitRunOfLength(text, expectedLen);
+                        if (candidate != null) {
+                            int d = editDistance(candidate, candidatePin);
+                            if (d < bestDist) { bestDist = d; best = candidate; }
+                        }
+                    } catch (Exception e) {
+                        log.debug("Digit-only embedded PSM{} page {} failed: {}", psm, pageIdx + 1, e.getMessage());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Digit-only embedded image page {} failed: {}", pageIdx + 1, e.getMessage());
+        }
+
+        if (best != null && bestDist > 0 && bestDist <= 2) {
+            log.info("Digit-only refinement page {}: {} → {} (edit dist={})",
+                    pageIdx + 1, candidatePin, best, bestDist);
+            return best;
+        }
+        log.debug("Digit-only refinement page {}: no improvement (bestDist={}), keeping {}",
+                pageIdx + 1, bestDist, candidatePin);
+        return candidatePin;
+    }
+
+    /**
+     * Among all digit runs in {@code text} (allowing embedded spaces/tabs from OCR),
+     * return the one whose stripped length equals {@code targetLen}, preferring the
+     * first occurrence if there are ties. Returns null if no such run exists.
+     */
+    private String longestDigitRunOfLength(String text, int targetLen) {
+        if (text == null || text.isBlank()) return null;
+        Matcher m = FALLBACK_OCR.matcher(text);
+        String found = null;
+        while (m.find()) {
+            String raw = m.group(1);
+            String clean = raw.replaceAll("[ \\t]+", "");
+            if (clean.matches("\\d+") && clean.length() == targetLen) {
+                if (found == null) found = clean; // keep first (left-to-right = natural reading order)
+            }
+        }
+        return found;
     }
 
     // ── Core PIN-extraction helpers ───────────────────────────────────────────────
