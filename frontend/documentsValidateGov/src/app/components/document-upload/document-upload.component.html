@@ -29,39 +29,40 @@
     </div>
   }
 
-  <!-- Upload Zone -->
-  <div
-    id="dropzone"
-    class="dropzone"
-    [class.drag-over]="isDragOver()"
-    [class.has-files]="hasFiles()"
-    (dragover)="onDragOver($event)"
-    (dragleave)="onDragLeave($event)"
-    (drop)="onDrop($event)"
-    (click)="fileInput.click()"
-  >
-    <input
-      #fileInput
-      type="file"
-      accept=".pdf"
-      multiple
-      (change)="onFileSelect($event)"
-      class="file-input"
-    />
-
-    <div class="dropzone-content">
-      <div class="upload-icon" [class.pulse]="isDragOver()">
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-          <polyline points="17 8 12 3 7 8"/>
-          <line x1="12" y1="3" x2="12" y2="15"/>
-        </svg>
+  <!-- Upload Zone (oculto mientras procesa) -->
+  @if (!isLoading()) {
+    <div
+      id="dropzone"
+      class="dropzone"
+      [class.drag-over]="isDragOver()"
+      [class.has-files]="hasFiles()"
+      (dragover)="onDragOver($event)"
+      (dragleave)="onDragLeave($event)"
+      (drop)="onDrop($event)"
+      (click)="fileInput.click()"
+    >
+      <input
+        #fileInput
+        type="file"
+        accept=".pdf"
+        multiple
+        (change)="onFileSelect($event)"
+        class="file-input"
+      />
+      <div class="dropzone-content">
+        <div class="upload-icon" [class.pulse]="isDragOver()">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+        </div>
+        <p class="dropzone-title">Arrastra tus archivos PDF aquí</p>
+        <p class="dropzone-subtitle">o haz clic para seleccionar archivos</p>
+        <div class="dropzone-badge">PDF</div>
       </div>
-      <p class="dropzone-title">Arrastra tus archivos PDF aquí</p>
-      <p class="dropzone-subtitle">o haz clic para seleccionar archivos</p>
-      <div class="dropzone-badge">PDF</div>
     </div>
-  </div>
+  }
 
   <!-- File List -->
   @if (hasFiles()) {
@@ -74,59 +75,157 @@
           </svg>
           {{ files().length }} archivo{{ files().length > 1 ? 's' : '' }} seleccionado{{ files().length > 1 ? 's' : '' }}
         </h2>
-        <button class="btn-ghost" (click)="clearAll()">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="3 6 5 6 21 6"/>
-            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-          </svg>
-          Limpiar todo
-        </button>
+        @if (!isLoading()) {
+          <button class="btn-ghost" (click)="clearAll()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+            Limpiar todo
+          </button>
+        }
       </div>
 
+      <!-- Barra de progreso -->
+      @if (isLoading() || allDone()) {
+        <div class="progress-section">
+          <div class="progress-header">
+            <span class="progress-label">
+              @if (isLoading()) { Procesando documentos... }
+              @else { Procesamiento completado }
+            </span>
+            <span class="progress-count">{{ processedCount() }} / {{ totalCount() }}</span>
+          </div>
+          <div class="progress-bar-track">
+            <div class="progress-bar-fill" [style.width.%]="progressPercent()"></div>
+          </div>
+          @if (isLoading()) {
+            <p class="processing-hint">
+              <span class="hint-dot"></span>
+              {{ currentLoadingMsg() }}
+            </p>
+          }
+        </div>
+      }
+
+      <!-- Lista de archivos con estado por archivo -->
       <div class="file-list">
         @for (file of files(); track $index) {
-          <div class="file-item" [style.animation-delay]="$index * 50 + 'ms'">
-            <div class="file-icon">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                <polyline points="14 2 14 8 20 8"/>
-              </svg>
+          <div class="file-item"
+               [class.file-processing]="getFileState(file.name) === 'processing'"
+               [class.file-done]="getFileState(file.name) === 'done'"
+               [style.animation-delay]="$index * 50 + 'ms'">
+
+            <!-- Icono de estado -->
+            <div class="file-icon-wrap">
+              @if (getFileState(file.name) === 'done') {
+                <div class="file-state-icon state-done">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <polyline points="20 6 9 17 4 12"/>
+                  </svg>
+                </div>
+              } @else if (getFileState(file.name) === 'processing') {
+                <div class="file-state-icon state-processing">
+                  <div class="mini-spinner"></div>
+                </div>
+              } @else {
+                <div class="file-state-icon state-pending">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"/>
+                    <polyline points="12 6 12 12 16 14"/>
+                  </svg>
+                </div>
+              }
             </div>
+
             <div class="file-info">
               <span class="file-name">{{ file.name }}</span>
-              <span class="file-size">{{ formatFileSize(file.size) }}</span>
+              <div class="file-meta">
+                <span class="file-size">{{ formatFileSize(file.size) }}</span>
+                @if (getFileState(file.name) === 'processing') {
+                  <span class="status-pill pill-processing">Procesando...</span>
+                } @else if (getFileState(file.name) === 'done') {
+                  <span class="status-pill" [class]="'pill-' + getFileResult(file.name)!.status.toLowerCase()">
+                    {{ getStatusLabel(getFileResult(file.name)!.status) }}
+                  </span>
+                } @else if (isLoading()) {
+                  <span class="status-pill pill-pending">En espera</span>
+                }
+              </div>
             </div>
-            <button class="btn-remove" (click)="removeFile($index); $event.stopPropagation()">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="18" y1="6" x2="6" y2="18"/>
-                <line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
-            </button>
+
+            @if (!isLoading()) {
+              <button class="btn-remove" (click)="removeFile($index); $event.stopPropagation()">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="18" y1="6" x2="6" y2="18"/>
+                  <line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+              </button>
+            }
           </div>
         }
       </div>
 
-      <button
-        id="validate-btn"
-        class="btn-primary"
-        (click)="validateDocuments(); $event.stopPropagation()"
-        [disabled]="isLoading()"
-      >
-        @if (isLoading()) {
-          <div class="spinner"></div>
-          <span>Validando documentos...</span>
-        } @else {
+      @if (!isLoading()) {
+        <button
+          id="validate-btn"
+          class="btn-primary"
+          (click)="validateDocuments(); $event.stopPropagation()"
+        >
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M9 12l2 2 4-4"/>
             <path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/>
           </svg>
-          <span>Validar Documentos</span>
-        }
-      </button>
+          <span>Validar Documento{{ files().length > 1 ? 's' : '' }}</span>
+        </button>
+      }
     </div>
   }
 
-  <!-- Results -->
+  <!-- Panel de espera (primer procesamiento, sin resultados aún) -->
+  @if (isLoading() && !hasResults()) {
+    <div class="processing-panel">
+      <div class="scan-icon-wrap">
+        <svg class="scan-doc-icon" width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+          <line x1="8" y1="13" x2="16" y2="13"/>
+          <line x1="8" y1="17" x2="11" y2="17"/>
+        </svg>
+        <div class="scan-beam"></div>
+      </div>
+      <h3 class="processing-title">Analizando tus documentos</h3>
+      <p class="processing-msg">{{ currentLoadingMsg() }}</p>
+
+      <div class="process-steps">
+        <div class="process-step">
+          <div class="step-bullet active"></div>
+          <span>Extracción de texto</span>
+        </div>
+        <div class="step-connector"></div>
+        <div class="process-step">
+          <div class="step-bullet active"></div>
+          <span>Identificación del PIN</span>
+        </div>
+        <div class="step-connector"></div>
+        <div class="process-step">
+          <div class="step-bullet"></div>
+          <span>Consulta a la SNR</span>
+        </div>
+      </div>
+
+      <div class="processing-note">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/>
+          <line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <span>Los PDFs escaneados requieren OCR y pueden demorar más tiempo que los digitales.</span>
+      </div>
+    </div>
+  }
+
+  <!-- Resultados (aparecen conforme llegan) -->
   @if (hasResults()) {
     <div class="results-section">
       <h2 class="section-title">
@@ -135,11 +234,17 @@
           <polyline points="22 4 12 14.01 9 11.01"/>
         </svg>
         Resultados de Validación
+        @if (isLoading()) {
+          <span class="live-badge">
+            <span class="live-dot"></span>
+            En curso
+          </span>
+        }
       </h2>
 
       <div class="results-grid">
-        @for (result of results(); track $index) {
-          <div class="result-card" [class]="getStatusClass(result.status)" [style.animation-delay]="$index * 100 + 'ms'">
+        @for (result of results(); track result.fileName) {
+          <div class="result-card" [class]="getStatusClass(result.status)">
             <div class="result-header">
               <div class="result-status-badge" [class]="getStatusClass(result.status)">
                 <span class="status-icon">{{ getStatusIcon(result.status) }}</span>
@@ -164,44 +269,45 @@
         }
       </div>
 
-      <!-- Summary Table -->
-      <div class="summary-table-wrapper">
-        <table class="summary-table" id="results-table">
-          <thead>
-            <tr>
-              <th>Archivo</th>
-              <th>PIN</th>
-              <th>Estado</th>
-              <th>Mensaje</th>
-            </tr>
-          </thead>
-          <tbody>
-            @for (result of results(); track $index) {
+      <!-- Tabla resumen (solo cuando termina) -->
+      @if (allDone()) {
+        <div class="summary-table-wrapper">
+          <table class="summary-table" id="results-table">
+            <thead>
               <tr>
-                <td>{{ result.fileName }}</td>
-                <td><code>{{ result.pin }}</code></td>
-                <td>
-                  <span class="table-badge" [class]="getStatusClass(result.status)">
-                    {{ getStatusLabel(result.status) }}
-                  </span>
-                </td>
-                <td>{{ result.message }}</td>
+                <th>Archivo</th>
+                <th>PIN</th>
+                <th>Estado</th>
+                <th>Mensaje</th>
               </tr>
-            }
-          </tbody>
-        </table>
-      </div>
-    </div>
-  }
+            </thead>
+            <tbody>
+              @for (result of results(); track result.fileName) {
+                <tr>
+                  <td>{{ result.fileName }}</td>
+                  <td><code>{{ result.pin }}</code></td>
+                  <td>
+                    <span class="table-badge" [class]="getStatusClass(result.status)">
+                      {{ getStatusLabel(result.status) }}
+                    </span>
+                  </td>
+                  <td>{{ result.message }}</td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
 
-  <!-- Loading Overlay -->
-  @if (isLoading()) {
-    <div class="loading-overlay">
-      <div class="loading-card">
-        <div class="loading-spinner-large"></div>
-        <p class="loading-text">Procesando documentos...</p>
-        <p class="loading-subtext">Extrayendo PIN y validando con la SNR</p>
-      </div>
+        <div class="post-actions">
+          <button class="btn-ghost" (click)="clearAll()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+            Nueva validación
+          </button>
+        </div>
+      }
     </div>
   }
 </div>

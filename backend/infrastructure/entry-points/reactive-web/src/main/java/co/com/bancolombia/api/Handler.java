@@ -39,7 +39,7 @@ public class Handler {
         Flux<DocumentValidationResult> results = validateDocumentsUseCase.validate(files);
 
         return ServerResponse.ok()
-                .contentType(MediaType.APPLICATION_JSON)
+                .contentType(MediaType.APPLICATION_NDJSON)
                 .body(results, DocumentValidationResult.class);
     }
 

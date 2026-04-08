@@ -1,6 +1,7 @@
-import { Component, signal, computed } from '@angular/core';
+import { Component, signal, computed, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { ValidationService, ValidationResult } from '../../services/validation.service';
+import { Subscription } from 'rxjs';
 
 @Component({
   selector: 'app-document-upload',
@@ -9,17 +10,44 @@ import { ValidationService, ValidationResult } from '../../services/validation.s
   templateUrl: './document-upload.component.html',
   styleUrl: './document-upload.component.css'
 })
-export class DocumentUploadComponent {
+export class DocumentUploadComponent implements OnDestroy {
   files = signal<File[]>([]);
   results = signal<ValidationResult[]>([]);
   isLoading = signal(false);
   isDragOver = signal(false);
   errorMessage = signal<string | null>(null);
+  currentLoadingMsg = signal('Iniciando procesamiento...');
 
   hasFiles = computed(() => this.files().length > 0);
   hasResults = computed(() => this.results().length > 0);
+  processedCount = computed(() => this.results().length);
+  totalCount = computed(() => this.files().length);
+  progressPercent = computed(() =>
+    this.totalCount() > 0 ? (this.processedCount() / this.totalCount()) * 100 : 0
+  );
+  allDone = computed(() =>
+    !this.isLoading() && this.processedCount() === this.totalCount() && this.totalCount() > 0
+  );
+
+  private subscription?: Subscription;
+  private msgInterval?: ReturnType<typeof setInterval>;
+
+  private readonly loadingMessages = [
+    'Extrayendo texto del PDF...',
+    'Analizando el contenido del documento...',
+    'Consultando la Superintendencia de Notariado y Registro...',
+    'Verificando autenticidad del PIN...',
+    'Procesando siguiente documento...',
+    'Los PDFs escaneados pueden tardar un poco más...',
+    'Aplicando reconocimiento óptico de caracteres (OCR)...',
+  ];
 
   constructor(private validationService: ValidationService) {}
+
+  ngOnDestroy(): void {
+    this.subscription?.unsubscribe();
+    if (this.msgInterval) clearInterval(this.msgInterval);
+  }
 
   onDragOver(event: DragEvent): void {
     event.preventDefault();
@@ -37,11 +65,8 @@ export class DocumentUploadComponent {
     event.preventDefault();
     event.stopPropagation();
     this.isDragOver.set(false);
-
     const droppedFiles = event.dataTransfer?.files;
-    if (droppedFiles) {
-      this.addFiles(droppedFiles);
-    }
+    if (droppedFiles) this.addFiles(droppedFiles);
   }
 
   onFileSelect(event: Event): void {
@@ -68,9 +93,12 @@ export class DocumentUploadComponent {
   }
 
   clearAll(): void {
+    this.subscription?.unsubscribe();
+    if (this.msgInterval) clearInterval(this.msgInterval);
     this.files.set([]);
     this.results.set([]);
     this.errorMessage.set(null);
+    this.isLoading.set(false);
   }
 
   validateDocuments(): void {
@@ -79,18 +107,42 @@ export class DocumentUploadComponent {
     this.isLoading.set(true);
     this.results.set([]);
     this.errorMessage.set(null);
+    this.currentLoadingMsg.set(this.loadingMessages[0]);
 
-    this.validationService.validateDocuments(this.files()).subscribe({
-      next: (results) => {
-        this.results.set(results);
-        this.isLoading.set(false);
+    let msgIndex = 0;
+    this.msgInterval = setInterval(() => {
+      msgIndex = (msgIndex + 1) % this.loadingMessages.length;
+      this.currentLoadingMsg.set(this.loadingMessages[msgIndex]);
+    }, 3500);
+
+    this.subscription = this.validationService.validateDocuments(this.files()).subscribe({
+      next: (result) => {
+        this.results.update(current => [...current, result]);
       },
       error: (err) => {
         this.errorMessage.set('Error al conectar con el servidor. Verifica que el backend esté ejecutándose.');
         this.isLoading.set(false);
-        console.error('Validation error:', err);
+        if (this.msgInterval) clearInterval(this.msgInterval);
+        console.error('Error de validación:', err);
+      },
+      complete: () => {
+        this.isLoading.set(false);
+        if (this.msgInterval) clearInterval(this.msgInterval);
       }
     });
+  }
+
+  getFileResult(fileName: string): ValidationResult | undefined {
+    return this.results().find(r => r.fileName === fileName);
+  }
+
+  getFileState(fileName: string): 'pending' | 'processing' | 'done' {
+    if (this.getFileResult(fileName)) return 'done';
+    if (!this.isLoading()) return 'pending';
+    // Backend processes up to 4 files concurrently, mark those as "processing"
+    const pendingFiles = this.files().filter(f => !this.getFileResult(f.name));
+    const processingSet = new Set(pendingFiles.slice(0, 4).map(f => f.name));
+    return processingSet.has(fileName) ? 'processing' : 'pending';
   }
 
   getStatusClass(status: string): string {
