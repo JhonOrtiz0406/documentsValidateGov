@@ -8,9 +8,13 @@ COPY gradle/ gradle/
 COPY build.gradle settings.gradle main.gradle gradle.properties lombok.config ./
 
 # Copy subproject build files
-COPY applications/ applications/
-COPY domain/ domain/
-COPY infrastructure/ infrastructure/
+COPY backend/applications/ applications/
+COPY backend/domain/ domain/
+COPY backend/infrastructure/ infrastructure/
+
+COPY backend/gradle/ gradle/
+COPY backend/gradlew backend/gradlew.bat ./
+COPY backend/build.gradle backend/settings.gradle backend/main.gradle backend/gradle.properties backend/lombok.config ./
 
 # Build the application
 RUN chmod +x gradlew && ./gradlew clean build -x test -x pitest --no-daemon
