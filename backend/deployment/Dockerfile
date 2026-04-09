@@ -3,18 +3,14 @@ FROM eclipse-temurin:25-jdk-alpine AS builder
 WORKDIR /app
 
 # Copy Gradle wrapper and project files
-COPY gradlew gradlew.bat ./
-COPY gradle/ gradle/
-COPY build.gradle settings.gradle main.gradle gradle.properties lombok.config ./
+COPY backend/gradlew backend/gradlew.bat ./
+COPY backend/gradle/ gradle/
+COPY backend/build.gradle backend/settings.gradle backend/main.gradle backend/gradle.properties backend/lombok.config ./
 
-# Copy subproject build files
+# Copy subprojects
 COPY backend/applications/ applications/
 COPY backend/domain/ domain/
 COPY backend/infrastructure/ infrastructure/
-
-COPY backend/gradle/ gradle/
-COPY backend/gradlew backend/gradlew.bat ./
-COPY backend/build.gradle backend/settings.gradle backend/main.gradle backend/gradle.properties backend/lombok.config ./
 
 # Build the application
 RUN chmod +x gradlew && ./gradlew clean build -x test -x pitest --no-daemon
