@@ -41,6 +41,6 @@ USER appuser
 ENV TESSDATA_PREFIX="/usr/share/tessdata"
 ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=70 -Djava.security.egd=file:/dev/./urandom"
 
-EXPOSE 8080
+EXPOSE 8088
 
 ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar /app/app.jar"]

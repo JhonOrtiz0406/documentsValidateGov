@@ -1,5 +1,6 @@
 import { Injectable } from '@angular/core';
 import { Observable } from 'rxjs';
+import { environment } from '../../../environments/environment';
 
 export interface ValidationResult {
   fileName: string;
@@ -13,7 +14,7 @@ export interface ValidationResult {
 })
 export class ValidationService {
 
-  private apiUrl = 'http://localhost:8088/api/validate-documents';
+  private apiUrl = environment.apiUrl;
 
   validateDocuments(files: File[]): Observable<ValidationResult> {
     return new Observable(observer => {

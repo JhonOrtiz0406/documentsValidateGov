@@ -17,7 +17,7 @@ management:
       probes:
         enabled: true
 cors:
-  allowed-origins: "http://localhost:4200,http://localhost:8080,http://localhost"
+  allowed-origins: "http://localhost:4200,http://localhost:8080,http://localhost,https://documentsvalidate.bystepsolutions.tech"
 snr:
   api:
     url: "https://certificados.supernotariado.gov.co/certificado/external/validation/validate.snr"
