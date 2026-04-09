@@ -13,7 +13,7 @@ COPY backend/domain/ domain/
 COPY backend/infrastructure/ infrastructure/
 
 # Build the application
-RUN chmod +x gradlew && ./gradlew clean build -x test -x pitest --no-daemon
+RUN chmod +x gradlew && ./gradlew clean build -x test -x pitest -x validateStructure --no-daemon
 
 # ============ Stage 2: Run ============
 FROM eclipse-temurin:25-jre-alpine
